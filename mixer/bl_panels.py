@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module define Blender Panels and UI types for the addon.
 """
@@ -13,8 +30,8 @@ from mixer.bl_utils import get_mixer_props, get_mixer_prefs
 from mixer.bl_properties import UserItem
 from mixer.share_data import share_data
 from mixer.broadcaster.common import ClientAttributes
-from mixer.blender_data.debug_addon import DebugDataPanel
-from mixer import __version__
+from mixer.blender_data.debug_addon import DebugDataPanel, use_debug_addon
+from mixer import display_version
 
 if TYPE_CHECKING:
     from mixer.bl_preferences import MixerPreferences
@@ -104,7 +121,11 @@ def collapsable_panel(
 ):
     row = layout.row()
     row.prop(
-        data, property, icon="TRIA_DOWN" if getattr(data, property) else "TRIA_RIGHT", icon_only=True, emboss=False,
+        data,
+        property,
+        icon="TRIA_DOWN" if getattr(data, property) else "TRIA_RIGHT",
+        icon_only=True,
+        emboss=False,
     )
     if alert:
         row.alert = True
@@ -122,7 +143,6 @@ class ROOM_UL_ItemRenderer(bpy.types.UIList):  # noqa
         split.alignment = "CENTER"
         split.label(text="Name")
         split.label(text="Users")
-        split.label(text="Experimental Sync")
         split.label(text="Keep Open")
         if get_mixer_props().display_rooms_details:
             split.label(text="Command Count")
@@ -133,7 +153,6 @@ class ROOM_UL_ItemRenderer(bpy.types.UIList):  # noqa
         split = layout.split()
         split.label(text=item.name)  # avoids renaming the item by accident
         split.label(text=f"{item.users_count if item.users_count >= 0 else '?'} users")
-        split.prop(item, "experimental_sync", text="")
         split.prop(item, "keep_open", text="")
         if get_mixer_props().display_rooms_details:
             split.prop(item, "command_count", text="")
@@ -155,18 +174,16 @@ def draw_connection_settings_ui(layout: bpy.types.UILayout):
 
 def draw_advanced_settings_ui(layout: bpy.types.UILayout):
     mixer_prefs = get_mixer_prefs()
+    layout.prop(mixer_prefs, "data_directory", text="Data Directory")
     layout.prop(mixer_prefs, "log_level")
-    layout.prop(mixer_prefs, "env")
     layout.prop(mixer_prefs, "show_server_console")
+    layout.prop(mixer_prefs, "vrtist_protocol")
 
 
 def draw_developer_settings_ui(layout: bpy.types.UILayout):
     mixer_prefs = get_mixer_prefs()
-    layout.prop(mixer_prefs, "statistics_directory", text="Stats Directory")
-    layout.operator(bl_operators.OpenStatsDirOperator.bl_idname, text="Open Directory")
-    layout.operator(bl_operators.WriteStatisticsOperator.bl_idname, text="Write Statistics")
-    layout.prop(mixer_prefs, "auto_save_statistics", text="Auto Save Statistics")
     layout.prop(mixer_prefs, "no_send_scene_content", text="No send_scene_content")
+    layout.prop(mixer_prefs, "no_start_server", text="Do not start server on connect")
     layout.prop(mixer_prefs, "send_base_meshes", text="Send Base Meshes")
     layout.prop(mixer_prefs, "send_baked_meshes", text="Send Baked Meshes")
     layout.prop(mixer_prefs, "commands_send_interval")
@@ -191,7 +208,6 @@ def draw_preferences_ui(mixer_prefs: MixerPreferences, context: bpy.types.Contex
     layout = mixer_prefs.layout.box().column()
     layout.label(text="Room Settings")
     layout.prop(mixer_prefs, "room", text="Default Room Name")
-    layout.prop(mixer_prefs, "experimental_sync")
 
     layout = mixer_prefs.layout.box().column()
     layout.label(text="Advanced Settings")
@@ -203,7 +219,7 @@ def draw_preferences_ui(mixer_prefs: MixerPreferences, context: bpy.types.Contex
 
 
 class MixerSettingsPanel(bpy.types.Panel):
-    bl_label = f"Mixer {__version__}"
+    bl_label = f"Mixer {display_version or '(Unknown version)'}"
     bl_idname = "MIXER_PT_mixer_settings"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -260,7 +276,7 @@ class MixerSettingsPanel(bpy.types.Panel):
                     user_layout.separator(factor=0.2)
 
         if collapsable_panel(
-            layout, mixer_props, "display_snapping_options", alert=True, text=f"Sync Options - Not implemented yet"
+            layout, mixer_props, "display_snapping_options", alert=True, text="Sync Options - Not implemented yet"
         ):
             box = layout.box().column()
             if share_data.client.current_room is None:
@@ -300,19 +316,11 @@ class MixerSettingsPanel(bpy.types.Panel):
                 split = layout.split(factor=0.6)
                 split.prop(mixer_prefs, "room", text="Room")
                 split.operator(bl_operators.CreateRoomOperator.bl_idname)
-                row = layout.row()
-                row.prop(
-                    mixer_prefs,
-                    "experimental_sync",
-                    text="Experimental sync (should be checked/unchecked before joining room)",
-                )
             else:
                 split = layout.split(factor=0.6)
-                split.label(
-                    text=f"Room: {share_data.client.current_room}{(' (experimental sync)' if mixer_prefs.experimental_sync else '')}"
-                )
+                split.label(text=f"Room: {share_data.client.current_room}")
                 split.label(text=f"Join: {get_mixer_props().joining_percentage * 100:.2f} %")
-                split.operator(bl_operators.LeaveRoomOperator.bl_idname, text=f"Leave Room")
+                split.operator(bl_operators.LeaveRoomOperator.bl_idname, text="Leave Room")
 
             self.draw_rooms(layout)
             self.draw_users(layout)
@@ -363,22 +371,29 @@ class VRtistSettingsPanel(bpy.types.Panel):
     bl_idname = "MIXER_PT_vrtist_settings"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Mixer"
+    bl_category = "VRtist"
 
     def draw(self, context):
         layout = self.layout
         mixer_prefs = get_mixer_prefs()
+
+        draw_user_settings_ui(layout.row())
+        draw_connection_settings_ui(layout.row())
+        layout.prop(mixer_prefs, "room", text="Room")
+
+        layout.operator(bl_operators.LaunchVRtistOperator.bl_idname, text="Launch VRTist")
         layout.prop(
             mixer_prefs, "VRtist", text="Path", icon=("ERROR" if not os.path.exists(mixer_prefs.VRtist) else "NONE")
         )
-        layout.operator(bl_operators.LaunchVRtistOperator.bl_idname, text="Launch VRTist")
 
 
-panels = (
+panels = [
     MixerSettingsPanel,
     VRtistSettingsPanel,
-    DebugDataPanel,
-)
+]
+
+if use_debug_addon:
+    panels.append(DebugDataPanel)
 
 
 def update_panels_category(self, context):
@@ -389,11 +404,14 @@ def update_panels_category(self, context):
                 bpy.utils.unregister_class(panel)
 
         for panel in panels:
-            panel.bl_category = mixer_prefs.category
+            if panel.bl_label == "VRtist":
+                panel.bl_category = mixer_prefs.vrtist_category
+            else:
+                panel.bl_category = mixer_prefs.category
             bpy.utils.register_class(panel)
 
     except Exception as e:
-        logger.error(f"Updating Panel category has failed {e}")
+        logger.error(f"Updating Panel category has failed {e!r}")
 
 
 classes = (ROOM_UL_ItemRenderer, MixerSettingsPanel, VRtistSettingsPanel)

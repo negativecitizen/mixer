@@ -1,4 +1,24 @@
-"""Interface to the bpy.data collections
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Interface to the bpy.data collections
+
+TODO This module is obsolete and should be removed
 """
 import functools
 import logging
@@ -29,7 +49,7 @@ rna_identifier_to_collection_name = {value.bl_rna.identifier: key for key, value
 
 class BlendDataCollection:
     """
-    Wrapper to any of the collections inside bpy.data
+    Obsolete wrapper to any of the collections inside bpy.data
     """
 
     # DO NOT keep references to bpy.data collection. They become stale and to not show modifications
@@ -65,7 +85,7 @@ class BlendDataCollection:
 
     def remove(self, name_full):
         if self._name == "scenes":
-            # search for __last_scene_to_be_removed__
+            # search for _mixer_to_be_removed_
             logger.error("Not implemented : remove scene %s", name_full)
             return
         item = self.items.get(name_full)
@@ -95,7 +115,7 @@ class BlendDataCollection:
 
 class BlendData:
     """
-    Wrapper to bpy.data, with linear time access to collection items by name.
+    Mostly obsolete wrapper to bpy.data, with linear time access to collection items by name.
 
     These objects keep live reference to Blender blenddata collection, so they must not be used after the
     file has been reloaded, hence the handler below.
@@ -152,12 +172,6 @@ class BlendData:
 
     def bpy_collection(self, collection_name: str) -> T.bpy_prop_collection:
         return self._collections.get(collection_name).bpy_collection()
-
-    def bl_collection_name_from_inner_identifier(self, type_identifier: str) -> str:
-        """
-        Blenddata collection from the name of the inner type (e.g. 'Object', 'Light')
-        """
-        return self._collections_name_from_inner_identifier[type_identifier]
 
     def bl_collection_name_from_ID(self, id: T.ID) -> str:  # noqa N802
         """

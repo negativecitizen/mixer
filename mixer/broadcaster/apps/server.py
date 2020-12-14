@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2020 Ubisoft
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """
 Server application.
 
@@ -10,6 +32,7 @@ import logging
 import argparse
 import select
 import threading
+import time
 import socket
 import queue
 from typing import List, Mapping, Dict, Optional, Any
@@ -17,6 +40,7 @@ from typing import List, Mapping, Dict, Optional, Any
 from mixer.broadcaster.cli_utils import init_logging, add_logging_cli_args
 import mixer.broadcaster.common as common
 from mixer.broadcaster.common import update_attributes_and_get_diff
+from mixer.broadcaster.socket import Socket
 
 SHUTDOWN = False
 
@@ -31,8 +55,8 @@ MAX_BROADCAST_COMMAND_COUNT = 64
 class Connection:
     """ Represent a connection with a client """
 
-    def __init__(self, server: Server, sock: socket.socket, address):
-        self.socket: socket.socket = sock
+    def __init__(self, server: Server, sock: Socket, address):
+        self.socket: Socket = sock
         self.address = address
         self.room: Optional[Room] = None
 
@@ -57,9 +81,12 @@ class Connection:
             common.ClientAttributes.ROOM: self.room.name if self.room is not None else None,
         }
 
+    def broadcast_error(self, command: common.Command):
+        self._server.broadcast_to_all_clients(command)
+
     def run(self):
         def _send_error(s: str):
-            logger.warning("Sending error %s", s)
+            logger.error("Sending error %s", s)
             self.send_command(common.Command(common.MessageType.SEND_ERROR, common.encode_string(s)))
 
         def _join_room(command: common.Command):
@@ -70,11 +97,11 @@ class Connection:
             try:
                 self._server.join_room(self, room_name)
             except Exception as e:
-                _send_error(f"{e}")
+                _send_error(f"{e!r}")
 
         def _leave_room(command: common.Command):
             if self.room is None:
-                _send_error(f"Received leave_room but no room is joined")
+                _send_error("Received leave_room but no room is joined")
                 return
             _ = command.data.decode()  # todo remove room_name from protocol
             self._server.leave_room(self)
@@ -129,6 +156,7 @@ class Connection:
             common.MessageType.LEAVE_ROOM: _leave_room,
             common.MessageType.LIST_ROOMS: _list_rooms,
             common.MessageType.DELETE_ROOM: _delete_room,
+            common.MessageType.SEND_ERROR: lambda x: self.broadcast_error(x),
             common.MessageType.SET_ROOM_CUSTOM_ATTRIBUTES: _set_room_custom_attributes,
             common.MessageType.SET_ROOM_KEEP_OPEN: _set_room_keep_open,
             common.MessageType.LIST_CLIENTS: _list_clients,
@@ -142,6 +170,8 @@ class Connection:
             received_commands = common.read_all_messages(self.socket)
             count = len(received_commands)
             if count > 0:
+                # upstream
+                time.sleep(self.latency)
                 logger.debug("Received from %s - %d commands ", self.unique_id, count)
 
             for command in received_commands:
@@ -172,6 +202,10 @@ class Connection:
                 _handle_incoming_commands()
                 _handle_outgoing_commands()
             except common.ClientDisconnectedException:
+                break
+            except Exception:
+                logger.exception("Exception during command processing. Disconnecting")
+                logger.error(f"Disconnecting {self.custom_attributes.get(common.ClientAttributes.USERNAME, 'Unknown')}")
                 break
 
         self._server.handle_client_disconnect(self)
@@ -311,8 +345,13 @@ class Room:
                     ):
                         self._commands.pop()
                         self.byte_size -= stored_command.byte_size()
-            self._commands.append(command)
-            self.byte_size += command.byte_size()
+            if (
+                command_type != common.MessageType.CLIENT_ID_WRAPPER
+                and command_type != common.MessageType.FRAME
+                and command_type != common.MessageType.QUERY_ANIMATION_DATA
+            ):
+                self._commands.append(command)
+                self.byte_size += command.byte_size()
 
         with self._commands_mutex:
             current_byte_size = self.byte_size
@@ -337,6 +376,8 @@ class Server:
         self._rooms: Dict[str, Room] = {}
         self._connections: Dict[str, Connection] = {}
         self._mutex = threading.RLock()
+        self.latency: float = 0.0  # seconds
+        self.bandwidth: float = 0.0  # MBps
 
     def delete_room(self, room_name: str):
         with self._mutex:
@@ -424,7 +465,10 @@ class Server:
             return
 
         self.broadcast_to_all_clients(
-            common.Command(common.MessageType.ROOM_UPDATE, common.encode_json({room.name: attributes}),)
+            common.Command(
+                common.MessageType.ROOM_UPDATE,
+                common.encode_json({room.name: attributes}),
+            )
         )
 
     def set_room_custom_attributes(self, room_name: str, custom_attributes: Mapping[str, Any]):
@@ -490,7 +534,11 @@ class Server:
                 readable, _, _ = select.select([sock], [], [], timeout)
                 if len(readable) > 0:
                     client_socket, client_address = sock.accept()
+                    client_socket = Socket(client_socket)
+                    client_socket.set_bandwidth(self.bandwidth, self.bandwidth)
+
                     connection = Connection(self, client_socket, client_address)
+                    connection.latency = self.latency
                     with self._mutex:
                         self._connections[connection.unique_id] = connection
                     connection.start()
@@ -508,10 +556,15 @@ def main():
     global _log_server_updates
     args, args_parser = parse_cli_args()
     init_logging(args)
-
+    if args.latency > 0.0:
+        logger.warning(f"Latency set to {args.latency} ms")
+    if args.bandwidth > 0.0:
+        logger.warning(f"Bandwidth limited to {args.bandwidth} Mbps")
     _log_server_updates = args.log_server_updates
 
     server = Server()
+    server.latency = args.latency / 1000.0
+    server.bandwidth = args.bandwidth
     server.run(args.port)
 
 
@@ -520,6 +573,10 @@ def parse_cli_args():
     add_logging_cli_args(parser)
     parser.add_argument("--port", type=int, default=common.DEFAULT_PORT)
     parser.add_argument("--log-server-updates", action="store_true")
+    parser.add_argument(
+        "--bandwidth", type=float, default=0.0, help="simulate bandwidth limitation (megabytes per second)"
+    )
+    parser.add_argument("--latency", type=float, default=0.0, help="simulate network latency (in milliseconds)")
     return parser.parse_args(), parser
 
 

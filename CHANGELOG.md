@@ -1,7 +1,121 @@
-# WIP
+# 0.19.0 (wip)
+
+## Fixes
+
+- Decimate modifier: fix synchronization of delimit attribute
+
+# 0.18.0 (2020-11-18)
+
+## Features
+
+- UI: remove "experimental synchronization" checkbox. Blender generic synchronization mode is now the default mode.
+- UI: move VRtist UI into its own panel.
+- UI: simplify Mixer panel.
+- Bezier curves: synchronization.
+- Node trees: synchronization for objects, world and lights (except nodes groups).
+- VRtist: sky synchronization.
+
+## Improvements
+
+- Performance: transfer less mesh data with linked meshes and when modifiers are updated.
+
+## Fixes
+
+- Image: image data is synchronized when source folder does not exist on receiver machine.
+- Mesh: new part not linked to collection after separate.
+- Mesh: misc synchronization errors (UV map, existing faces).
+- Grease pencil: duplicate layers during session.
+- Metaball: update fixes
+- Synchronization: update datablock reference (e.g. TextureNodeImage.image, ArrayModifier.object_offset, Scene.camera).
+- Synchronization: some updates performed in non-object mode were ignored.
+- Server: dangling connections
+
+## Other
+
+- Tests: add tests for Mesh synchronization
+- Refactoring: bpy_prop_collection synchronization.
+- Refactoring: mesh synchronization.
+- Logging: remove meaningless ReferenceError messages.
+- Logging: add exception type when logging an exception.
+- Logging: add information about Blender version, Mixer version and loaded addons.
+- Code health: remove stats module
+
+
+# 0.17.0 (2020-10-15)
+
+## Features
+
+- Object modifiers (except those using Image and Curve)
+- GreasePencil modifiers
+- Change instances collection
+- VRtist: move animations keys times
+- VRtist: now receives start/end frame
+- VRtist: per keyframe interpolation
+- VRtist: baked mesh optimization
+
+## Bugfix
+
+- Fix synchronization problems after renaming
+- Fix synchronization problems after simultaneous creation
+- Fix create object and edit with object popup breaks synchronization
+- Fix synchronization problem after loading an asset with unsupported features, such as armatures
+- Fix synchronization problem after creating an object then editing its properties with the properties popup
+- Guard against infinite recursion when synchronized data has circular references
+
+## Tests
+
+- Add tests with multiple Blender that perform simultaneous modifications
+- Add a server option to simulate network latency
+
+## CI/CD
+
+- Add optional build info to the version tag
+- Upgrade Flake and Black
 
 ## Documentation
+
+- Update docs/synchronization.md to describe incremental synchronization
+- Update docs/hosting.md with instructions about Zerotier
+
+## Refactor
+
+- Split blender_data/proxy.py into multiple files
+
+
+# 0.16.1 (2020-09-22)
+
+## Bugfix
+
+- VRtist: Don't restore original mesh after baking if the original object was not a mesh
+
+## CI/CD
+
+- Merge gitlab.com CI script into main CI script using `only` and `except` clauses.
+
+# 0.16.0 (2020-09-17)
+
+## Features
+
+- Put back sync of `proxy_storage` and `proxy_dir` fields of SequenceEditor (#146)
+- VRtist: Packed frame related diffs for VRtist client
+
+## Bugfix
+
+- Fix mesh being triangulated after leaving edit mode. (#191)
+- Fix crash occurring when vertex group data is inconsistent (#121)
+- Fix send_base_mesh crash
+- Fix random test failure with room not joinable yet
+- Disconnects clients properly when server is killed
+- VRtist: Fixed synchro stuff
+
+## Documentation
+
 - update release.md (#206)
+
+## CI/CD
+
+- Add optional build info to the version tag
+- Upgrade Flake and Black
 
 # 0.15.0 (2020-08-12)
 

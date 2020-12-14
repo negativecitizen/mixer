@@ -1,27 +1,41 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import unittest
 
 import bpy
 from bpy import data as D  # noqa
 from bpy import types as T  # noqa
-from mixer.blender_data.tests.utils import equals, register_bl_equals, test_blend_file
 
-from mixer.blender_data import types
-from mixer.blender_data.proxy import (
-    BpyBlendProxy,
-    BpyStructProxy,
-    LoadElementAs,
-    VisitState,
-    load_as_what,
-)
-from mixer.blender_data.filter import test_context
+
+from mixer.blender_data.type_helpers import is_pointer_to
+from mixer.blender_data.bpy_data_proxy import BpyDataProxy
+from mixer.blender_data.filter import test_properties
+from mixer.blender_data.struct_proxy import StructProxy
+from mixer.blender_data.tests.utils import equals, register_bl_equals, test_blend_file
 
 
 # @unittest.skip('')
 class TestCore(unittest.TestCase):
     def setUp(self):
         bpy.ops.wm.open_mainfile(filepath=test_blend_file)
-        register_bl_equals(self, test_context)
-        self._visit_state = VisitState({}, {}, {}, test_context)
+        register_bl_equals(self, test_properties)
+        self._proxy = BpyDataProxy()
+        self._context = self._proxy.context()
 
     def test_issubclass(self):
 
@@ -88,41 +102,21 @@ class TestCore(unittest.TestCase):
                 # All ID are behind pointers or in collections
                 self.assertFalse(isinstance(prop.bl_rna, T.ID))
 
-    def test_load_as(self):
-        proxy = BpyBlendProxy()
-        proxy.load(test_context)
-        root_ids = proxy.root_ids
-        self.assertEqual(
-            LoadElementAs.STRUCT,
-            load_as_what(T.Scene.bl_rna.properties["display"], bpy.data.scenes[0].display, root_ids),
-        )
-        self.assertEqual(
-            LoadElementAs.ID_REF,
-            load_as_what(T.Scene.bl_rna.properties["objects"], bpy.data.scenes[0].objects, root_ids),
-        )
-        self.assertEqual(
-            LoadElementAs.ID_REF, load_as_what(T.Scene.bl_rna.properties["world"], bpy.data.scenes[0].world, root_ids),
-        )
-        self.assertEqual(
-            LoadElementAs.ID_DEF,
-            load_as_what(T.Scene.bl_rna.properties["collection"], bpy.data.scenes[0].collection, root_ids),
-        )
-
     def test_pointer_class(self):
         eevee = T.Scene.bl_rna.properties["eevee"]
-        self.assertTrue(types.is_pointer_to(eevee, T.SceneEEVEE))
+        self.assertTrue(is_pointer_to(eevee, T.SceneEEVEE))
 
         collection = T.Scene.bl_rna.properties["collection"]
-        self.assertTrue(types.is_pointer_to(collection, T.Collection))
+        self.assertTrue(is_pointer_to(collection, T.Collection))
         node_tree = T.World.bl_rna.properties["node_tree"]
-        self.assertTrue(types.is_pointer_to(node_tree, T.NodeTree))
-        self.assertFalse(types.is_pointer_to(node_tree, T.ShaderNodeTree))
+        self.assertTrue(is_pointer_to(node_tree, T.NodeTree))
+        self.assertFalse(is_pointer_to(node_tree, T.ShaderNodeTree))
 
         camera = T.Scene.bl_rna.properties["camera"]
-        self.assertTrue(types.is_pointer_to(camera, T.Object))
+        self.assertTrue(is_pointer_to(camera, T.Object))
 
         data = T.Object.bl_rna.properties["data"]
-        self.assertTrue(types.is_pointer_to(data, T.ID))
+        self.assertTrue(is_pointer_to(data, T.ID))
 
     def test_scene_viewlayer_layercollection_is_master(self):
         s = D.scenes["Scene_0"]
@@ -132,7 +126,7 @@ class TestCore(unittest.TestCase):
 
     def test_skip_ShaderNodeTree(self):  # noqa N802
         world = D.worlds["World"]
-        proxy = BpyStructProxy().load(world, self._visit_state)
+        proxy = StructProxy().load(world, "", self._context)
         self.assertTrue("color" in proxy._data)
         # self.assertFalse("node_tree" in proxy._data)
 

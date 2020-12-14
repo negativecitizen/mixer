@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module defines Blender Property types for the addon.
 """
@@ -14,13 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 class RoomItem(bpy.types.PropertyGroup):
-    def is_room_experimental(self):
+    def is_room_vrtist_protocol(self):
         if (
             share_data.client is not None
             and self.name in share_data.client.rooms_attributes
-            and "experimental_sync" in share_data.client.rooms_attributes[self.name]
+            and "vrtist_protocol" in share_data.client.rooms_attributes[self.name]
         ):
-            return share_data.client.rooms_attributes[self.name]["experimental_sync"]
+            return share_data.client.rooms_attributes[self.name]["vrtist_protocol"]
         return False
 
     def is_kept_open(self):
@@ -65,7 +82,7 @@ class RoomItem(bpy.types.PropertyGroup):
 
     name: bpy.props.StringProperty(name="Name")
     users_count: bpy.props.IntProperty(name="Users Count")
-    experimental_sync: bpy.props.BoolProperty(name="Experimental Sync", get=is_room_experimental)
+    vrtist_protocol: bpy.props.BoolProperty(name="VRtist Protocol", get=is_room_vrtist_protocol)
     keep_open: bpy.props.BoolProperty(name="Keep Open", default=False, get=is_kept_open, set=on_keep_open_changed)
     command_count: bpy.props.IntProperty(name="Command Count", get=get_command_count)
     mega_byte_size: bpy.props.FloatProperty(name="Mega Byte Size", get=get_mega_byte_size)
@@ -191,7 +208,8 @@ class MixerProperties(bpy.types.PropertyGroup):
         return self.snap_view_areas_values
 
     snap_view_user: bpy.props.EnumProperty(
-        items=get_snap_view_users, name="Snap View User",
+        items=get_snap_view_users,
+        name="Snap View User",
     )
     # todo: this cannot work, it depends on the 3d view panel
     # todo: so it should be a property of bpy.types.SpaceView3D probably.
@@ -199,17 +217,19 @@ class MixerProperties(bpy.types.PropertyGroup):
 
     snap_time_user_enabled: bpy.props.BoolProperty(default=False)
     snap_time_user: bpy.props.EnumProperty(
-        items=get_snap_view_users, name="Snap Time User",
+        items=get_snap_view_users,
+        name="Snap Time User",
     )
 
     snap_3d_cursor_user_enabled: bpy.props.BoolProperty(default=False)
     snap_3d_cursor_user: bpy.props.EnumProperty(
-        items=get_snap_view_users, name="Snap 3D Cursor User",
+        items=get_snap_view_users,
+        name="Snap 3D Cursor User",
     )
 
     display_advanced_room_control: bpy.props.BoolProperty(default=False)
     upload_room_name: bpy.props.StringProperty(default=f"{getuser()}_uploaded_room", name="Upload Room Name")
-    upload_room_filepath: bpy.props.StringProperty(default=f"", subtype="FILE_PATH", name="Upload Room File")
+    upload_room_filepath: bpy.props.StringProperty(default="", subtype="FILE_PATH", name="Upload Room File")
 
     joining_percentage: bpy.props.FloatProperty(default=0, name="Joining Percentage")
 

@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module define Blender Operators types for the addon.
 """
@@ -6,14 +23,21 @@ import logging
 import os
 import socket
 import subprocess
+import time
 
 import bpy
 
 from mixer.share_data import share_data
 from mixer.bl_utils import get_mixer_props, get_mixer_prefs
-from mixer.stats import save_statistics
-from mixer.broadcaster.common import RoomAttributes
-from mixer.connection import is_client_connected, connect, join_room, leave_current_room, disconnect
+from mixer.broadcaster.common import RoomAttributes, ClientAttributes
+from mixer.connection import (
+    is_client_connected,
+    connect,
+    join_room,
+    leave_current_room,
+    disconnect,
+    network_consumer_timer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +91,10 @@ class CreateRoomOperator(bpy.types.Operator):
         if not is_client_connected():
             return {"CANCELLED"}
 
-        join_room(get_mixer_prefs().room)
+        prefs = get_mixer_prefs()
+        room = prefs.room
+        logger.warning(f"CreateRoomOperator.execute({room})")
+        join_room(room, prefs.vrtist_protocol)
 
         return {"FINISHED"}
 
@@ -93,13 +120,13 @@ class JoinRoomOperator(bpy.types.Operator):
             (lambda: get_mixer_props().room_index < len(get_mixer_props().rooms), "Invalid room selection"),
             (
                 lambda: (
-                    ("experimental_sync" not in get_selected_room_dict() and not get_mixer_prefs().experimental_sync)
+                    ("vrtist_protocol" not in get_selected_room_dict() and not get_mixer_prefs().vrtist_protocol)
                     or (
-                        "experimental_sync" in get_selected_room_dict()
-                        and get_mixer_prefs().experimental_sync == get_selected_room_dict()["experimental_sync"]
+                        "vrtist_protocol" in get_selected_room_dict()
+                        and get_mixer_prefs().vrtist_protocol == get_selected_room_dict()["vrtist_protocol"]
                     )
                 ),
-                "Experimental flag does not match selected room",
+                "vrtist_protocol flag does not match selected room",
             ),
             (
                 lambda: get_selected_room_dict().get(RoomAttributes.JOINABLE, False),
@@ -122,7 +149,10 @@ class JoinRoomOperator(bpy.types.Operator):
         props = get_mixer_props()
         room_index = props.room_index
         room = props.rooms[room_index].name
-        join_room(room)
+        logger.warning(f"JoinRoomOperator.execute({room})")
+
+        prefs = get_mixer_prefs()
+        join_room(room, prefs.vrtist_protocol)
 
         return {"FINISHED"}
 
@@ -249,20 +279,19 @@ class ConnectOperator(bpy.types.Operator):
         prefs = get_mixer_prefs()
         try:
             self.report({"INFO"}, f'Connecting to "{prefs.host}:{prefs.port}" ...')
-            if not connect():
-                self.report({"ERROR"}, "unknown error, see log")
+            try:
+                connect()
+            except Exception as e:
+                self.report({"ERROR"}, f"mixer.connect error : {e!r}")
                 return {"CANCELLED"}
 
             self.report({"INFO"}, f'Connected to "{prefs.host}:{prefs.port}" ...')
-        except socket.gaierror as e:
+        except socket.gaierror:
             msg = f'Cannot connect to "{prefs.host}": invalid host name or address'
             self.report({"ERROR"}, msg)
-            if prefs.env != "production":
-                raise e
+            return {"CANCELLED"}
         except Exception as e:
             self.report({"ERROR"}, repr(e))
-            if prefs.env != "production":
-                raise e
             return {"CANCELLED"}
 
         return {"FINISHED"}
@@ -292,17 +321,70 @@ class LaunchVRtistOperator(bpy.types.Operator):
     bl_label = "Launch VRtist"
     bl_options = {"REGISTER"}
 
+    vrtist_process = None
+
     @classmethod
     def poll(cls, context):
+        # Check VRtist process to auto disconnect
+        if cls.vrtist_process is not None and cls.vrtist_process.poll() is not None:
+            cls.vrtist_process = None
+            leave_current_room()
+            disconnect()
+
+        # Manage button state
         return os.path.isfile(get_mixer_prefs().VRtist)
 
     def execute(self, context):
         bpy.data.window_managers["WinMan"].mixer.send_base_meshes = False
+        bpy.data.window_managers["WinMan"].mixer.send_bake_meshes = True
+
         mixer_prefs = get_mixer_prefs()
-        if not share_data.client.current_room:
-            if not connect():
+        if not share_data.client or not share_data.client.current_room:
+            timeout = 10
+            try:
+                connect()
+            except Exception as e:
+                self.report({"ERROR"}, f"vrtist.launch connect error : {e!r}")
                 return {"CANCELLED"}
-            join_room(mixer_prefs.room)
+
+            # Wait for local server creation
+            while timeout > 0 and not is_client_connected():
+                time.sleep(0.5)
+                timeout -= 0.5
+            if timeout <= 0:
+                self.report({"ERROR"}, "vrtist.launch connect error : unable to connect")
+                return {"CANCELLED"}
+
+            logger.warning("LaunchVRtistOperator.execute({mixer_prefs.room})")
+            join_room(mixer_prefs.room, True)
+
+            # Wait for room creation/join
+            timeout = 10
+            while timeout > 0 and share_data.client.current_room is None:
+                time.sleep(0.5)
+                timeout -= 0.5
+            if timeout <= 0:
+                self.report({"ERROR"}, "vrtist.launch connect error : unable to join room")
+                return {"CANCELLED"}
+
+            # Wait for client id
+            timeout = 10
+            while timeout > 0 and share_data.client.client_id is None:
+                network_consumer_timer()
+                time.sleep(0.1)
+                timeout -= 0.1
+            if timeout <= 0:
+                self.report({"ERROR"}, "vrtist.launch connect error : unable to retrieve client id")
+                return {"CANCELLED"}
+
+        color = share_data.client.clients_attributes[share_data.client.client_id].get(
+            ClientAttributes.USERCOLOR, (0.0, 0.0, 0.0)
+        )
+        color = (int(c * 255) for c in color)
+        color = "#" + "".join(f"{c:02x}" for c in color)
+        name = "VR " + share_data.client.clients_attributes[share_data.client.client_id].get(
+            ClientAttributes.USERNAME, "client"
+        )
 
         args = [
             mixer_prefs.VRtist,
@@ -314,33 +396,14 @@ class LaunchVRtistOperator(bpy.types.Operator):
             str(mixer_prefs.port),
             "--master",
             str(share_data.client.client_id),
+            "--usercolor",
+            color,
+            "--username",
+            name,
         ]
-        subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False)
-        return {"FINISHED"}
-
-
-class WriteStatisticsOperator(bpy.types.Operator):
-    """Write Mixer statistics in a file"""
-
-    bl_idname = "mixer.write_statistics"
-    bl_label = "Mixer Write Statistics"
-    bl_options = {"REGISTER"}
-
-    def execute(self, context):
-        if share_data.current_statistics is not None:
-            save_statistics(share_data.current_statistics, get_mixer_props().statistics_directory)
-        return {"FINISHED"}
-
-
-class OpenStatsDirOperator(bpy.types.Operator):
-    """Write Mixer stats directory in explorer"""
-
-    bl_idname = "mixer.open_stats_dir"
-    bl_label = "Mixer Open Stats Directory"
-    bl_options = {"REGISTER"}
-
-    def execute(self, context):
-        os.startfile(get_mixer_prefs().statistics_directory)
+        LaunchVRtistOperator.vrtist_process = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False
+        )
         return {"FINISHED"}
 
 
@@ -352,8 +415,6 @@ classes = (
     JoinRoomOperator,
     DeleteRoomOperator,
     LeaveRoomOperator,
-    WriteStatisticsOperator,
-    OpenStatsDirOperator,
     DownloadRoomOperator,
     UploadRoomOperator,
 )

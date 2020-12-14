@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module defines global state of the addon. It is encapsulated in a ShareData instance.
 """
@@ -5,14 +22,14 @@ This module defines global state of the addon. It is encapsulated in a ShareData
 from collections import namedtuple
 from datetime import datetime
 import logging
-from typing import List, Mapping, Set
+from typing import Dict, List, Mapping, Optional, Set
 from uuid import uuid4
 
-from mixer.blender_data.proxy import BpyBlendProxy
-from mixer.blender_data.filter import test_context
-from mixer.bl_utils import get_mixer_prefs
+from mixer.blender_data.bpy_data_proxy import BpyDataProxy
 
 import bpy
+import bpy.types as T  # noqa N812
+
 from mixer.shot_manager_data import ShotManager
 
 logger = logging.getLogger(__name__)
@@ -64,11 +81,6 @@ class ShareData:
         self.local_server_process = None
         self.selected_objects_names = []
 
-        self.current_statistics = None
-        self.current_stats_timer = None
-        self.auto_save_statistics = False
-        self.statistics_directory = None
-
         self.pending_test_update = False
 
         self.clear_room_data()
@@ -80,8 +92,6 @@ class ShareData:
         self.collections_added: Set(str) = set()
         self.collections_removed: Set(str) = set()
         self.scenes_added: List[str] = []
-        self.scenes_removed: List[str] = []
-        self.scenes_renamed: List[str, str] = []
 
         # key : collection name
         self.objects_added_to_collection: Mapping(str, str) = {}
@@ -147,7 +157,7 @@ class ShareData:
         self.start_frame = 0
         self.end_frame = 0
 
-        self.proxy: BpyBlendProxy = None
+        self.bpy_data_proxy: Optional[BpyDataProxy] = None
 
     def leave_current_room(self):
         if self.client is not None:
@@ -274,7 +284,6 @@ class ShareData:
         Clear the lists that record change between previous and current state
         """
         self.scenes_added.clear()
-        self.scenes_removed.clear()
 
         self.collections_added.clear()
         self.collections_removed.clear()
@@ -352,7 +361,11 @@ class ShareData:
         for obj in self.blender_objects.values():
             self.objects_transforms[obj.name_full] = obj.matrix_local.copy()
 
-    def sanitize_blender_ids(self, id_dict):
+    def sanitize_blender_ids(self, id_dict: Dict[str, T.ID], is_dirty: bool) -> Dict[str, T.ID]:
+        if is_dirty:
+            # avoid useless warnings if we are to rebuild anyway
+            return id_dict
+
         # todo investigate this
         # the classic error is ReferenceError: StructRNA of type Object has been removed
         # I think we should remove the lazy update of dicts, because references become stale, we don't know why
@@ -364,13 +377,11 @@ class ShareData:
                     value.name_full
                 ] = value  # the access value.name_full should trigger the error if the ID is invalid
             except ReferenceError as e:
-                logger.error(e)
-                if get_mixer_prefs().env == "development":
-                    raise  # raise back in development, for debugging
+                logger.error(f"{e!r}")
         return sanitized
 
     def update_current_data(self):
-        self._blender_objects = self.sanitize_blender_ids(self._blender_objects)
+        self._blender_objects = self.sanitize_blender_ids(self._blender_objects, self.blender_objects_dirty)
 
         self.update_scenes_info()
         self.update_collections_info()
@@ -380,23 +391,17 @@ class ShareData:
             x.name_full: x.parent.name_full if x.parent is not None else "" for x in self.blender_objects.values()
         }
 
-    def init_proxy(self):
-        if self.use_experimental_sync():
-            # default, not safe
-            # the initialisation must initialize reference target for all useful collections (except screens, ...)
-            self.proxy.initialize_ref_targets(test_context)
-
-    def set_experimental_sync(self, experimental_sync: bool):
-        if experimental_sync:
-            logger.warning("Experimental sync in ON")
-            self.proxy = BpyBlendProxy()
+    def set_vrtist_protocol(self, vrtist_protocol: bool):
+        if not vrtist_protocol:
+            logger.warning("Generic protocol sync in ON")
+            self.bpy_data_proxy = BpyDataProxy()
         else:
-            if self.proxy:
-                logger.warning("Experimental sync in OFF")
-                self.proxy = None
+            logger.warning("VRtist protocol sync in ON")
+            if self.bpy_data_proxy:
+                self.bpy_data_proxy = None
 
-    def use_experimental_sync(self):
-        return self.proxy is not None
+    def use_vrtist_protocol(self):
+        return self.bpy_data_proxy is None
 
 
 share_data = ShareData()  # Instance storing addon state, is used by most of the sub-modules.

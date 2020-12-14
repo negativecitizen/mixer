@@ -1,43 +1,60 @@
-from typing import Any, List, Type
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+Simple types used by the addon and the tests.
 
-import bpy.types as T  # noqa N812
-import mathutils
+Must not include bpy
+"""
+from __future__ import annotations
 
-builtin_types = {type(None), float, int, bool, str, set, bytes}
-vector_types = {mathutils.Vector, mathutils.Color, mathutils.Quaternion, mathutils.Euler}
-
-
-def is_builtin(type_: Type):
-    return type_ in builtin_types
-
-
-def is_vector(type_: Type):
-    return type_ in vector_types
-
-
-def is_matrix(type_: Type):
-    return type_ is mathutils.Matrix
-
-
-def is_pointer(property_) -> bool:
-    return property_.bl_rna is T.PointerProperty.bl_rna
-
-
-def bases_of(rna_property: T.Property) -> List[Any]:
-    """
-    Including the current type and None as root
-    """
-    bases = []
-    base = rna_property
-    while base is not None:
-        bases.append(base)
-        base = None if base.base is None else base.base.bl_rna
-    return bases
+import array
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Union
 
 
-def is_instance(rna_property: T.Property, base: T.Property) -> bool:
-    return base in bases_of(rna_property)
+SoaMember = Tuple[str, array.array]
+"""Member of a structure of array from a Blender array of structure like MeshVertices
+- Name of the structure member, e.g, "co" or "normal"
+- Data to be loaded with foreach_set()
+"""
+
+Path = List[Union[str, int]]
+"""a data path starting from the datablock e.g. ["curves", 0, "bezier_points"]"""
 
 
-def is_pointer_to(rna_property: T.Property, base: type) -> bool:
-    return is_pointer(rna_property) and is_instance(rna_property.fixed_type, base.bl_rna)
+@dataclass
+class Soa:
+    """A structure of array, loaded from a Blender array of structure like MeshVertices"""
+
+    path: Path
+    """a data path to the array"""
+
+    members: List[SoaMember]
+
+
+ArrayGroup = List[Tuple[Any, array.array]]
+"""A logical group of related arrays, like vertex groups.
+
+The first item is an identifier for the DatablockProxy that uses the ArrayGroup. see MeshProxy.py:VertexGroups.
+Json serialization converts tuples into lists"""
+
+ArrayGroups = Dict[str, ArrayGroup]
+"""ArrayGroups contain arrays that must be serialized in binary format, mainly because of their size, but could
+otherwise be stored in Proxy._data
+
+TODO use ArrayGroups for Proxy._media and Proxy._soas
+"""

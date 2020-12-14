@@ -1,15 +1,38 @@
+# MIT License
+#
+# Copyright (c) 2020 Ubisoft
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """
 This module defines types and utilities used by client and server code.
 """
 
+import array
 from enum import IntEnum
-from typing import Dict, Mapping, Any, Optional, List
+from typing import Dict, Mapping, Any, Optional, List, Tuple
 import select
-import socket
 import struct
 import json
 import logging
 
+from mixer.broadcaster.socket import Socket
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 12800
@@ -56,7 +79,7 @@ class MessageType(IntEnum):
     DELETE = 101
     CAMERA = 102
     LIGHT = 103
-    MESHCONNECTION_DEPRECATED = 104
+    _MESHCONNECTION_DEPRECATED = 104
     RENAME = 105
     DUPLICATE = 106
     SEND_TO_TRASH = 107
@@ -80,13 +103,13 @@ class MessageType(IntEnum):
     GREASE_PENCIL_CONNECTION = 122
     GREASE_PENCIL_TIME_OFFSET = 123
     FRAME_START_END = 124
-    CAMERA_ANIMATION = 125
+    ANIMATION = 125
 
     REMOVE_OBJECT_FROM_SCENE = 126
     REMOVE_COLLECTION_FROM_SCENE = 127
 
     SCENE = 128
-    SCENE_REMOVED = 129
+    _SCENE_REMOVED_DEPRECATED = 129
 
     ADD_OBJECT_TO_VRTIST = 130
     OBJECT_VISIBILITY = 131
@@ -96,25 +119,32 @@ class MessageType(IntEnum):
     GROUP_BEGIN = 132
     GROUP_END = 133
 
-    SCENE_RENAMED = 134
+    _SCENE_RENAMED_DEPRECATED = 134
 
     ADD_KEYFRAME = 135
     REMOVE_KEYFRAME = 136
-    QUERY_CURRENT_FRAME = 137
-    QUERY_OBJECT_DATA = 138
+    MOVE_KEYFRAME = 137
+    QUERY_CURRENT_FRAME = 138
+    QUERY_ANIMATION_DATA = 139
 
-    BLENDER_DATA_UPDATE = 139
-    CAMERA_ATTRIBUTES = 140
+    BLENDER_DATA_UPDATE = 140
+    CAMERA_ATTRIBUTES = 141
+    LIGHT_ATTRIBUTES = 142
 
-    BLENDER_DATA_REMOVE = 141
-    BLENDER_DATA_RENAME = 142
+    BLENDER_DATA_REMOVE = 143
+    BLENDER_DATA_RENAME = 144
 
-    CLEAR_ANIMATIONS = 143
-    CURRENT_CAMERA = 144
-    SHOT_MANAGER_MONTAGE_MODE = 145
-    SHOT_MANAGER_CONTENT = 146
-    SHOT_MANAGER_CURRENT_SHOT = 147
-    SHOT_MANAGER_ACTION = 148
+    CLEAR_ANIMATIONS = 145
+    CURRENT_CAMERA = 146
+    SHOT_MANAGER_MONTAGE_MODE = 147
+    SHOT_MANAGER_CONTENT = 148
+    SHOT_MANAGER_CURRENT_SHOT = 149
+    SHOT_MANAGER_ACTION = 150
+
+    BLENDER_DATA_CREATE = 151
+    BLENDER_DATA_MEDIA = 152
+    EMPTY = 153
+    ASSET_BANK = 156
 
     OPTIMIZED_COMMANDS = 200
     TRANSFORM = 201
@@ -124,7 +154,7 @@ class MessageType(IntEnum):
     FRAME = 205
     PLAY = 206
     PAUSE = 207
-
+    WORLD_SKY = 208
     END_OPTIMIZED_COMMANDS = 999
 
     CLIENT_ID_WRAPPER = 1000
@@ -352,13 +382,22 @@ def decode_array(data, index, schema, inc):
 
 
 def decode_float_array(data, index):
-    return decode_array(data, index, "f", 4)
+    count = bytes_to_int(data[index : index + 4])
+    start = index + 4
+    values = []
+    end = start
+    for _ in range(count):
+        end = start + 4
+        values.extend(struct.unpack("f", data[start:end]))
+        start = end
+    return values, end
 
 
 def decode_int_array(data, index):
     count = bytes_to_int(data[index : index + 4])
     start = index + 4
     values = []
+    end = start
     for _ in range(count):
         end = start + 4
         values.extend(struct.unpack("I", data[start:end]))
@@ -380,6 +419,23 @@ def decode_vector3_array(data, index):
 
 def decode_vector2_array(data, index):
     return decode_array(data, index, "2f", 2 * 4)
+
+
+def encode_py_array(data: array.array) -> bytes:
+    typecode = data.typecode
+    count = data.buffer_info()[1]
+    byte_count = count * data.itemsize
+    buffer = encode_string(typecode) + encode_int(byte_count) + data.tobytes()
+    return buffer
+
+
+def decode_py_array(buffer: bytes, index: int) -> Tuple[array.array, int]:
+    typecode, index = decode_string(buffer, index)
+    byte_count, index = decode_int(buffer, index)
+    array_ = array.array(typecode, b"")
+    slice_ = buffer[index : index + byte_count]
+    array_.frombytes(slice_)
+    return array_, index + byte_count
 
 
 class Command:
@@ -437,7 +493,7 @@ class CommandFormatter:
         return s
 
 
-def recv(socket: socket.socket, size: int):
+def recv(socket: Socket, size: int):
     """
     Try to read size bytes from the socket.
     Raise ClientDisconnectedException if the socket is disconnected.
@@ -460,7 +516,7 @@ def recv(socket: socket.socket, size: int):
     return result
 
 
-def read_message(socket: socket.socket, timeout: Optional[float] = None) -> Optional[Command]:
+def read_message(socket: Socket, timeout: Optional[float] = None) -> Optional[Command]:
     """
     Try to read a full message from the socket.
     Raise ClientDisconnectedException if the socket is disconnected.
@@ -471,7 +527,7 @@ def read_message(socket: socket.socket, timeout: Optional[float] = None) -> Opti
         return None
 
     select_timeout = timeout if timeout is not None else 0.0001
-    r, _, _ = select.select([socket], [], [], select_timeout)
+    r, _, _ = select.select([socket._socket], [], [], select_timeout)
     if len(r) == 0:
         return None
 
@@ -494,7 +550,7 @@ def read_message(socket: socket.socket, timeout: Optional[float] = None) -> Opti
         raise
 
 
-def read_all_messages(socket: socket.socket, timeout: Optional[float] = None) -> List[Command]:
+def read_all_messages(socket: Socket, timeout: Optional[float] = None) -> List[Command]:
     """
     Try to read all messages waiting on the socket.
     Raise ClientDisconnectedException if the socket is disconnected.
@@ -509,7 +565,7 @@ def read_all_messages(socket: socket.socket, timeout: Optional[float] = None) ->
     return received_commands
 
 
-def write_message(sock: Optional[socket.socket], command: Command):
+def write_message(sock: Optional[Socket], command: Command):
     if not sock:
         logger.warning("write_message called with no socket")
         return
@@ -517,7 +573,7 @@ def write_message(sock: Optional[socket.socket], command: Command):
     buffer = command.to_byte_buffer()
 
     try:
-        _, w, _ = select.select([], [sock], [])
+        _, w, _ = select.select([], [sock._socket], [])
         if sock.sendall(buffer) is not None:
             raise ClientDisconnectedException()
     except (ConnectionAbortedError, ConnectionResetError) as e:

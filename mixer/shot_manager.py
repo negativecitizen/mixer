@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module defines how Shot Manager messages are handled.
 
@@ -33,6 +50,7 @@ def get_shot_manager():
     sm_props = None
     try:
         sm_props = shot_manager.get_shot_manager(bpy.context.scene)
+        shot_manager.initialize_shot_manager(sm_props)
     except Exception:
         pass
     return sm_props
@@ -64,8 +82,8 @@ def build_shot_manager_action(data):
         end, index = common.decode_int(data, index)
         camera_name, index = common.decode_string(data, index)
         camera = None
-        # if len(camera_name) > 0:
-        camera = bpy.data.objects[camera_name]
+        if len(camera_name) > 0:
+            camera = bpy.data.objects[camera_name]
 
         color, index = common.decode_color(data, index)
 
@@ -111,8 +129,6 @@ def build_shot_manager_action(data):
             shot.set_end(s, end)
         if len(camera) > 0:
             shot.set_camera(s, bpy.data.objects[camera])
-        if color[0] > -1:
-            shot.set_color(s, color)
         if enabled != -1:
             shot.set_enable_state(s, enabled)
 
@@ -124,10 +140,10 @@ def send_montage_mode():
 
 def check_montage_mode():
     winman = bpy.data.window_managers["WinMan"]
-    if not hasattr(winman, "UAS_shot_manager_handler_toggle"):
+    if not hasattr(winman, "UAS_shot_manager_shots_play_mode"):
         return False
 
-    montage_mode = winman.UAS_shot_manager_handler_toggle
+    montage_mode = winman.UAS_shot_manager_shots_play_mode
     if share_data.shot_manager.montage_mode is None or montage_mode != share_data.shot_manager.montage_mode:
         share_data.shot_manager.montage_mode = montage_mode
         send_montage_mode()

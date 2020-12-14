@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module define how the addon connect and interact with the server, for the Mixer protocol.
 It updates the addon state according to this connection.
@@ -13,11 +30,10 @@ import subprocess
 import time
 from pathlib import Path
 
-from mixer.stats import save_statistics, get_stats_filename
-from mixer.blender_data.blenddata import BlendData
 from mixer.draw_handlers import remove_draw_handlers
-from mixer.blender_client import SendSceneContentFailed, BlenderClient
+from mixer.blender_client.client import SendSceneContentFailed, BlenderClient
 from mixer.handlers import HandlerManager
+from mixer.os_utils import tech_infos
 
 
 logger = logging.getLogger(__name__)
@@ -32,11 +48,14 @@ def set_client_attributes():
     )
 
 
-def join_room(room_name: str):
-    logger.info("join_room")
+def join_room(room_name: str, vrtist_protocol: bool = False):
+    prefs = get_mixer_prefs()
+    logger.warning(f"join: room: {room_name}, user: {prefs.user}")
+
+    for line in tech_infos():
+        logger.warning(line)
 
     assert share_data.client.current_room is None
-    BlendData.instance().reset()
     share_data.session_id += 1
     # todo tech debt -> current_room should be set when JOIN_ROOM is received
     # todo _joining_room_name should be set in client timer
@@ -46,18 +65,7 @@ def join_room(room_name: str):
     share_data.client.join_room(room_name)
     share_data.client.send_set_current_scene(bpy.context.scene.name_full)
 
-    share_data.current_statistics = {
-        "session_id": share_data.session_id,
-        "blendfile": bpy.data.filepath,
-        "statsfile": get_stats_filename(share_data.run_id, share_data.session_id),
-        "user": get_mixer_prefs().user,
-        "room": room_name,
-        "children": {},
-    }
-    prefs = get_mixer_prefs()
-    share_data.auto_save_statistics = prefs.auto_save_statistics
-    share_data.statistics_directory = prefs.statistics_directory
-    share_data.set_experimental_sync(prefs.experimental_sync)
+    share_data.set_vrtist_protocol(vrtist_protocol)
     share_data.pending_test_update = False
 
     # join a room <==> want to track local changes
@@ -72,12 +80,6 @@ def leave_current_room():
         HandlerManager.set_handlers(False)
 
     share_data.clear_before_state()
-
-    if share_data.current_statistics is not None and share_data.auto_save_statistics:
-        save_statistics(share_data.current_statistics, share_data.statistics_directory)
-    share_data.current_statistics = None
-    share_data.auto_save_statistics = False
-    share_data.statistics_directory = None
 
 
 def is_joined():
@@ -118,29 +120,28 @@ def is_localhost(host):
 
 
 def connect():
-    logger.info("connect")
-    BlendData.instance().reset()
+    prefs = get_mixer_prefs()
+    logger.info(f"connect to {prefs.host}:{prefs.port}")
     if share_data.client is not None:
         # a server shutdown was not processed
         logger.debug("connect: share_data.client is not None")
         share_data.client = None
 
-    prefs = get_mixer_prefs()
     if not create_main_client(prefs.host, prefs.port):
         if is_localhost(prefs.host):
+            if prefs.no_start_server:
+                raise RuntimeError(
+                    f"Cannot connect to existing server at {prefs.host}:{prefs.port} and MIXER_NO_START_SERVER environment variable exists"
+                )
             start_local_server()
             if not wait_for_server(prefs.host, prefs.port):
-                logger.error("Unable to start local server")
-                return False
+                raise RuntimeError("Unable to start local server")
         else:
-            logger.error("Unable to connect to remote server %s:%s", prefs.host, prefs.port)
-            return False
+            raise RuntimeError(f"Unable to connect to remote server {prefs.host}:{prefs.port}")
 
     assert is_client_connected()
 
     set_client_attributes()
-
-    return True
 
 
 def disconnect():
@@ -149,7 +150,6 @@ def disconnect():
     logger.info("disconnect")
 
     leave_current_room()
-    BlendData.instance().reset()
 
     remove_draw_handlers()
 
@@ -173,8 +173,6 @@ def network_consumer_timer():
     if not share_data.client.is_connected():
         error_msg = "Timer still registered but client disconnected."
         logger.error(error_msg)
-        if get_mixer_prefs().env != "production":
-            raise RuntimeError(error_msg)
         # Returning None from a timer unregister it
         return None
 
@@ -190,9 +188,7 @@ def network_consumer_timer():
         disconnect()
         return None
     except Exception as e:
-        logger.error(e, stack_info=True)
-        if get_mixer_prefs().env == "development":
-            raise
+        logger.error(f"{e!r}", stack_info=True)
 
     # Run every 1 / 100 seconds
     return 0.01

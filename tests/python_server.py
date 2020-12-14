@@ -1,11 +1,13 @@
 import argparse
 import asyncio
 import logging
+import struct
 import sys
 
 import bpy
 
 from mixer.share_data import share_data
+from mixer.broadcaster.common import decode_int
 
 """
 Socket server for Blender that receives python strings, compiles
@@ -21,22 +23,26 @@ https://blender.stackexchange.com/questions/41533/how-to-remotely-run-a-python-s
 """
 
 logger = logging.getLogger("tests")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 # hardcoded to avoid control from a remote machine
 HOST = "127.0.0.1"
 STRING_MAX = 1024 * 1024
+INT_SIZE = struct.calcsize("i")
 
 
 async def exec_buffer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     while True:
-        buffer = await reader.read(STRING_MAX)
+        buffer = await reader.read(INT_SIZE)
+        length, _ = decode_int(buffer, 0)
+        buffer = await reader.read(length)
         if not buffer:
             break
         addr = writer.get_extra_info("peername")
-        logger.info("-- Received %s bytes from %s", len(buffer), addr)
+        logger.debug("-- Received %s bytes from %s", len(buffer), addr)
         logger.debug(buffer.decode("utf-8"))
+        buffer_string = buffer.decode("utf-8")
         try:
-            code = compile(buffer, "<string>", "exec")
+            code = compile(buffer_string, "<string>", "exec")
             share_data.pending_test_update = True
             exec(code, {})
         except Exception:
@@ -44,8 +50,11 @@ async def exec_buffer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
             logger.error("Exception")
             logger.error(traceback.format_exc())
+            logger.error("While processing: ")
+            for line in buffer_string.splitlines():
+                logger.error(line)
 
-        logger.info("-- Done")
+        logger.debug("-- Done")
 
 
 async def serve(port: int):
@@ -183,7 +192,9 @@ if __name__ == "__main__":
 
             ptvsd.enable_attach(address=("localhost", args.ptvsd), redirect_output=True)
             if args.wait_for_debugger:
+                logger.warning(f"Waiting for debugger on port {args.ptvsd}")
                 ptvsd.wait_for_attach()
+                logger.warning("Debugger attached")
         except ImportError:
             pass
 

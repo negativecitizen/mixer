@@ -1,129 +1,250 @@
-"""
-This module handles generic updates using the blender_data package.
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-The goal for Mixer is to replace all code specific to entities (camera, light, material, ...) by this generic update
-mechanism.
 """
+Send BLENDER_DATA messages, receive and process them
+"""
+from __future__ import annotations
 
+import itertools
 import logging
-from typing import List, Tuple
+import traceback
+from typing import List, TYPE_CHECKING
 
-from mixer.blender_data.json_codec import Codec
-from mixer.blender_data.proxy import BpyIDProxy
-from mixer.broadcaster import common
-from mixer.log_utils import log_traceback
+from mixer.blender_data.json_codec import Codec, DecodeError, EncodeError
+from mixer.blender_data.messages import (
+    BlenderDataMessage,
+    BlenderMediaMessage,
+    BlenderRemoveMessage,
+    BlenderRenamesMessage,
+)
+from mixer.broadcaster.common import Command, MessageType
+from mixer.local_data import get_local_or_create_cache_file
 from mixer.share_data import share_data
+
+if TYPE_CHECKING:
+    from mixer.blender_data.changeset import CreationChangeset, RemovalChangeset, UpdateChangeset, RenameChangeset
+    from mixer.blender_data.datablock_proxy import DatablockProxy
+    from mixer.blender_data.proxy import Delta, Uuid
+    from mixer.blender_data.types import Soa
+
 
 logger = logging.getLogger(__name__)
 
-# No explicit creations here.
-# The creations are perfomed as part of an update of an item that does not exist.
+
+def send_media_creations(proxy: DatablockProxy):
+    bytes_ = BlenderMediaMessage.encode(proxy)
+    if bytes_:
+        command = Command(MessageType.BLENDER_DATA_MEDIA, bytes_, 0)
+        share_data.client.add_command(command)
+
+
+def build_data_media(buffer: bytes):
+    # TODO save to resolved path.
+    # The packed data with be saved to file, not a problem
+    message = BlenderMediaMessage()
+    message.decode(buffer)
+    # TODO this does not overwrite outdated local files
+    get_local_or_create_cache_file(message.path, message.bytes_)
+
+
+def send_data_creations(proxies: CreationChangeset):
+    if share_data.use_vrtist_protocol():
+        return
+
+    codec = Codec()
+
+    for datablock_proxy in proxies:
+        logger.info("%s %s", "send_data_create", datablock_proxy)
+        send_media_creations(datablock_proxy)
+        try:
+            encoded_proxy = codec.encode(datablock_proxy)
+        except EncodeError as e:
+            logger.error(f"send_data_create: encode exception for {datablock_proxy}")
+            logger.error(f"... {e!r}")
+            return
+        except Exception:
+            logger.error(f"send_data_create: encode exception for {datablock_proxy}")
+            for line in traceback.format_exc().splitlines():
+                logger.error(line)
+            return
+
+        buffer = BlenderDataMessage.encode(datablock_proxy, encoded_proxy)
+        command = Command(MessageType.BLENDER_DATA_CREATE, buffer, 0)
+        share_data.client.add_command(command)
+
+
+def send_data_updates(updates: UpdateChangeset):
+    if share_data.use_vrtist_protocol():
+        return
+
+    codec = Codec()
+    for update in updates:
+        logger.info("%s %s", "send_data_update", update)
+
+        try:
+            encoded_update = codec.encode(update)
+        except Exception:
+            logger.error(f"send_data_update: encode exception for {update}")
+            for line in traceback.format_exc().splitlines():
+                logger.error(line)
+            continue
+
+        buffer = BlenderDataMessage.encode(update.value, encoded_update)
+        command = Command(MessageType.BLENDER_DATA_UPDATE, buffer, 0)
+        share_data.client.add_command(command)
+
+
+def build_data_create(buffer):
+    if share_data.use_vrtist_protocol():
+        return
+
+    share_data.set_dirty()
+    rename_changeset = None
+    codec = Codec()
+    try:
+        message = BlenderDataMessage()
+        message.decode(buffer)
+        datablock_proxy = codec.decode(message.proxy_string)
+        logger.info("%s %s", "build_data_create", datablock_proxy)
+        datablock_proxy.arrays = message.arrays
+        _, rename_changeset = share_data.bpy_data_proxy.create_datablock(datablock_proxy)
+        _build_soas(datablock_proxy.mixer_uuid, message.soas)
+    except DecodeError as e:
+        logger.error(f"Decode error for {str(e.args[1])[:100]} ...")
+        logger.error("... possible version mismatch")
+        return
+    except Exception:
+        logger.error("Exception during build_data_create")
+        for line in traceback.format_exc().splitlines():
+            logger.error(line)
+        logger.error(buffer[0:200])
+        logger.error("...")
+        logger.error(buffer[-200:0])
+        logger.error("ignored")
+        return
+
+    if rename_changeset:
+        send_data_renames(rename_changeset)
+
+
+def _build_soas(uuid: Uuid, soas: List[Soa]):
+    try:
+        for soa in soas:
+            share_data.bpy_data_proxy.update_soa(uuid, soa.path, soa.members)
+    except Exception:
+        logger.error(f"Exception during update_soa for {uuid} {soa.path}")
+        for line in traceback.format_exc().splitlines():
+            logger.error(line)
+        logger.error("ignored")
+
+
+def build_data_update(buffer: bytes):
+    if share_data.use_vrtist_protocol():
+        return
+
+    share_data.set_dirty()
+    codec = Codec()
+    try:
+        message = BlenderDataMessage()
+        message.decode(buffer)
+        delta: Delta = codec.decode(message.proxy_string)
+        logger.info("%s: %s", "build_data_update", delta)
+        delta.value.arrays = message.arrays
+        share_data.bpy_data_proxy.update_datablock(delta)
+
+        datablock_proxy = delta.value
+        if datablock_proxy is not None:
+            _build_soas(datablock_proxy.mixer_uuid, message.soas)
+
+    except DecodeError as e:
+        logger.error(f"Decode error for {str(e.args[1])[:100]} ...")
+        logger.error("... possible version mismatch")
+    except Exception:
+        logger.error("Exception during build_data_update")
+        for line in traceback.format_exc().splitlines():
+            logger.error(line)
+        logger.error(f"During processing of buffer for {delta}")
+        logger.error(buffer[0:200])
+        logger.error("...")
+        logger.error(buffer[-200:0])
+        logger.error("ignored")
+
+
+def send_data_removals(removals: RemovalChangeset):
+    if share_data.use_vrtist_protocol():
+        return
+
+    for uuid, _, debug_info in removals:
+        logger.warning("send_removal: %s (%s)", uuid, debug_info)
+        buffer = BlenderRemoveMessage.encode(uuid, debug_info)
+        command = Command(MessageType.BLENDER_DATA_REMOVE, buffer, 0)
+        share_data.client.add_command(command)
 
 
 def build_data_remove(buffer):
-    if not share_data.use_experimental_sync():
+    if share_data.use_vrtist_protocol():
         return
 
-    collection_name, index = common.decode_string(buffer, 0)
-    key, index = common.decode_string(buffer, index)
-    logger.info("build_data_remove: %s[%s]", collection_name, key)
-    # Update through the proxy so that it updates itself and does not trigger removals
-    share_data.proxy.remove_one(collection_name, key)
+    message = BlenderRemoveMessage()
+    message.decode(buffer)
+    logger.warning("build_data_remove: %s (%s)", message.uuid, message.debug_info)
+    share_data.bpy_data_proxy.remove_datablock(message.uuid)
 
     # TODO temporary until VRtist protocol uses Blenddata instead of blender_objects & co
     share_data.set_dirty()
 
 
-class InvalidPath(Exception):
-    pass
-
-
-def blenddata_path(proxy):
-    if proxy._blenddata_path is None:
-        logger.error("blenddata_path is None. _data is ...")
-        logger.error(f"... {proxy._data}")
-        raise InvalidPath
-
-    collection_name, key, *path = proxy._blenddata_path
-    if collection_name is None or key is None:
-        logger.error("invalid blenddata_path : %s[%s], ", collection_name, key)
-        raise InvalidPath
-
-    if path:
-        logger.error("blenddata_path %s[%s] has non empty tail %s", collection_name, key, path)
-        raise InvalidPath
-
-    return collection_name, key
-
-
-#
-# WARNING There ara duplicate keys in blendata collections with linked blendfiles
-#
-def build_data_update(buffer):
-    if not share_data.use_experimental_sync():
+def send_data_renames(renames: RenameChangeset):
+    if not renames:
+        return
+    if share_data.use_vrtist_protocol():
         return
 
-    buffer, _ = common.decode_string(buffer, 0)
-    codec = Codec()
-    try:
-        id_proxy = codec.decode(buffer)
-        try:
-            collection_name, key = blenddata_path(id_proxy)
-        except InvalidPath:
-            logger.error("... update ignored")
-            return
+    items = []
+    for uuid, old_name, new_name, debug_info in renames:
+        logger.warning("send_rename: %s (%s) into %s", uuid, debug_info, new_name)
+        items.extend([uuid, old_name, new_name])
 
-        uuid = id_proxy.mixer_uuid()
-        logger.info("build_data_update: %s[%s] %s", collection_name, key, uuid)
-        share_data.proxy.update_one(id_proxy)
-        # TODO temporary until VRtist protocol uses Blenddata instead of blender_objects & co
-        share_data.set_dirty()
-    except Exception:
-        logger.error("Exception during build_data_update")
-        log_traceback(logger.error)
-        logger.error(f"During processing of buffer with blenddata_path {id_proxy._blenddata_path}")
-        logger.error(buffer[0:200])
-        logger.error("...")
-        logger.error(buffer[-200:0])
-        logger.error(f"Creation or update of bpy.data.{collection_name}[{key}] was ignored")
+    buffer = BlenderRenamesMessage.encode(items)
+    command = Command(MessageType.BLENDER_DATA_RENAME, buffer, 0)
+    share_data.client.add_command(command)
 
 
-def send_data_removals(removals: List[Tuple[str, str]]):
-    if not share_data.use_experimental_sync():
+def build_data_rename(buffer):
+    if share_data.use_vrtist_protocol():
         return
 
-    for collection_name, key in removals:
-        logger.info("send_removal: %s[%s]", collection_name, key)
-        buffer = common.encode_string(collection_name) + common.encode_string(key)
-        command = common.Command(common.MessageType.BLENDER_DATA_REMOVE, buffer, 0)
-        share_data.client.add_command(command)
+    message = BlenderRenamesMessage()
+    message.decode(buffer)
+    renames = message.renames
 
+    # (uuid1, old1, new1, uuid2, old2, new2, ...) to ((uuid1, old1, new1), (uuid2, old2, new2), ...)
+    args = [iter(renames)] * 3
+    # do not consume the iterator on the log loop !
+    items = list(itertools.zip_longest(*args))
 
-def send_data_updates(updates: List[BpyIDProxy]):
-    if not share_data.use_experimental_sync():
-        return
-    if not updates:
-        return
-    codec = Codec()
-    for proxy in updates:
-        # We send an ID, so we need to make sure that it includes a bp.data collection name
-        # and the associated key
-        try:
-            collection_name, key = blenddata_path(proxy)
-        except InvalidPath:
-            logger.error("... update ignored")
-            continue
+    for uuid, old_name, new_name in items:
+        logger.warning("build_data_rename: %s (%s) into %s", uuid, old_name, new_name)
 
-        logger.info("send_data_update %s[%s]", collection_name, key)
+    rename_changeset = share_data.bpy_data_proxy.rename_datablocks(items)
 
-        try:
-            encoded_proxy = codec.encode(proxy)
-        except InvalidPath:
-            logger.error("send_update: Exception :")
-            log_traceback(logger.error)
-            logger.error(f"while processing bpy.data.{collection_name}[{key}]:")
+    # TODO temporary until VRtist protocol uses Blenddata instead of blender_objects & co
+    share_data.set_dirty()
 
-        # For BpyIdProxy, the target is encoded in the proxy._blenddata_path
-        buffer = common.encode_string(encoded_proxy)
-        command = common.Command(common.MessageType.BLENDER_DATA_UPDATE, buffer, 0)
-        share_data.client.add_command(command)
+    if rename_changeset:
+        send_data_renames(rename_changeset)

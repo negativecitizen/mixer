@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module defines Blender handlers for Mixer.
 
@@ -16,12 +33,11 @@ import logging
 import bpy
 
 from mixer.share_data import share_data
+from mixer import handlers_generic as generic
 from mixer.blender_client import collection as collection_api
-from mixer.blender_client import data as data_api
 from mixer.blender_client import object_ as object_api
 from mixer.blender_client import scene as scene_api
 import mixer.shot_manager as shot_manager
-from mixer.stats import stats_timer
 import itertools
 from typing import Mapping, Any
 from uuid import uuid4
@@ -29,11 +45,8 @@ from uuid import uuid4
 from bpy.app.handlers import persistent
 
 from mixer.share_data import object_visibility
-from mixer.stats import StatsTimer
-from mixer.blender_data.diff import BpyBlendDiff
-from mixer.blender_data.filter import safe_context
 from mixer.draw_handlers import remove_draw_handlers
-from mixer.blender_client import update_params
+from mixer.blender_client.client import update_params
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +85,7 @@ class HandlerManager:
     def _set_handlers(cls, connect: bool):
         try:
             if connect:
-                bpy.app.handlers.frame_change_post.append(handler_send_frame_changed)
+                # bpy.app.handlers.frame_change_post.append(handler_send_frame_changed)
                 bpy.app.handlers.depsgraph_update_post.append(handler_send_scene_data_to_server)
                 bpy.app.handlers.undo_pre.append(handler_on_undo_redo_pre)
                 bpy.app.handlers.redo_pre.append(handler_on_undo_redo_pre)
@@ -81,7 +94,7 @@ class HandlerManager:
                 bpy.app.handlers.load_post.append(handler_on_load)
             else:
                 bpy.app.handlers.load_post.remove(handler_on_load)
-                bpy.app.handlers.frame_change_post.remove(handler_send_frame_changed)
+                # bpy.app.handlers.frame_change_post.remove(handler_send_frame_changed)
                 bpy.app.handlers.depsgraph_update_post.remove(handler_send_scene_data_to_server)
                 bpy.app.handlers.undo_pre.remove(handler_on_undo_redo_pre)
                 bpy.app.handlers.redo_pre.remove(handler_on_undo_redo_pre)
@@ -110,22 +123,37 @@ def handler_send_frame_changed(scene):
     try:
         send_frame_changed(scene)
     finally:
-        share_data.client.synced_time_messages = False
+        share_data.client.send_command_pack()
+
+
+processing_depsgraph_handler = False
 
 
 @persistent
 def handler_send_scene_data_to_server(scene, dummy):
-    logger.debug("handler_send_scene_data_to_server")
-
-    # Ensure we will rebuild accessors when a depsgraph update happens
-    # todo investigate why we need this...
-    share_data.set_dirty()
-
-    if share_data.client.block_signals:
-        logger.debug("handler_send_scene_data_to_server canceled (block_signals = True)")
+    global processing_depsgraph_handler
+    if processing_depsgraph_handler:
+        logger.error("Depsgraph handler recursion attempt")
         return
 
-    send_scene_data_to_server(scene, dummy)
+    processing_depsgraph_handler = True
+    try:
+        logger.debug("handler_send_scene_data_to_server")
+
+        # Ensure we will rebuild accessors when a depsgraph update happens
+        # todo investigate why we need this...
+        share_data.set_dirty()
+
+        if share_data.client.block_signals:
+            logger.debug("handler_send_scene_data_to_server canceled (block_signals = True)")
+            return
+
+        if share_data.use_vrtist_protocol():
+            send_scene_data_to_server(scene, dummy)
+        else:
+            generic.send_scene_data_to_server(scene, dummy)
+    finally:
+        processing_depsgraph_handler = False
 
 
 class TransformStruct:
@@ -202,22 +230,12 @@ def update_scenes_state():
             scene.mixer_uuid = str(uuid4())
 
     scenes_after = {
-        scene.mixer_uuid: name
-        for name, scene in share_data.blender_scenes.items()
-        if name != "__last_scene_to_be_removed__"
+        scene.mixer_uuid: name for name, scene in share_data.blender_scenes.items() if name != "_mixer_to_be_removed_"
     }
     scenes_before = {
-        scene.mixer_uuid: name
-        for name, scene in share_data.scenes_info.items()
-        if name != "__last_scene_to_be_removed__"
+        scene.mixer_uuid: name for name, scene in share_data.scenes_info.items() if name != "_mixer_to_be_removed_"
     }
-    share_data.scenes_added, share_data.scenes_removed, share_data.scenes_renamed = find_renamed(
-        scenes_before, scenes_after
-    )
-
-    for old_name, new_name in share_data.scenes_renamed:
-        share_data.scenes_info[new_name] = share_data.scenes_info[old_name]
-        del share_data.scenes_info[old_name]
+    share_data.scenes_added, _, _ = find_renamed(scenes_before, scenes_after)
 
     # walk the old scenes
     for scene_name, scene_info in share_data.scenes_info.items():
@@ -317,14 +335,11 @@ def update_frame_changed_related_objects_state(old_objects: dict, new_objects: d
             share_data.objects_transformed.add(obj_name)
 
 
-@stats_timer(share_data)
 def update_object_state(old_objects: dict, new_objects: dict):
-    stats_timer = share_data.current_stats_timer
 
-    with stats_timer.child("checkobjects_addedAndRemoved"):
-        objects = set(new_objects.keys())
-        share_data.objects_added = objects - old_objects.keys()
-        share_data.objects_removed = old_objects.keys() - objects
+    objects = set(new_objects.keys())
+    share_data.objects_added = objects - old_objects.keys()
+    share_data.objects_removed = old_objects.keys() - objects
 
     share_data.old_objects = new_objects
 
@@ -334,26 +349,29 @@ def update_object_state(old_objects: dict, new_objects: dict):
         share_data.objects_removed.clear()
         return
 
+    if len(share_data.objects_added) > 1 and len(share_data.objects_removed) > 1:
+        logger.error(
+            f"more than one object renamed: unsupported{share_data.objects_added} {share_data.objects_removed}"
+        )
+
     for obj_name in share_data.objects_removed:
         if obj_name in share_data.old_objects:
             del share_data.old_objects[obj_name]
 
-    with stats_timer.child("updateObjectsParentingChanged"):
-        for obj_name, parent in share_data.objects_parents.items():
-            if obj_name not in share_data.old_objects:
-                continue
-            new_obj = share_data.old_objects[obj_name]
-            new_obj_parent = "" if new_obj.parent is None else new_obj.parent.name_full
-            if new_obj_parent != parent:
-                share_data.objects_reparented.add(obj_name)
+    for obj_name, parent in share_data.objects_parents.items():
+        if obj_name not in share_data.old_objects:
+            continue
+        new_obj = share_data.old_objects[obj_name]
+        new_obj_parent = "" if new_obj.parent is None else new_obj.parent.name_full
+        if new_obj_parent != parent:
+            share_data.objects_reparented.add(obj_name)
 
-    with stats_timer.child("update_objects_visibilityChanged"):
-        for obj_name, visibility in share_data.objects_visibility.items():
-            new_obj = share_data.old_objects.get(obj_name)
-            if not new_obj:
-                continue
-            if visibility != object_visibility(new_obj):
-                share_data.objects_visibility_changed.add(obj_name)
+    for obj_name, visibility in share_data.objects_visibility.items():
+        new_obj = share_data.old_objects.get(obj_name)
+        if not new_obj:
+            continue
+        if visibility != object_visibility(new_obj):
+            share_data.objects_visibility_changed.add(obj_name)
 
     update_frame_changed_related_objects_state(old_objects, new_objects)
 
@@ -408,17 +426,6 @@ def add_scenes():
     changed = False
     for scene in share_data.scenes_added:
         scene_api.send_scene(share_data.client, scene)
-        changed = True
-    for old_name, new_name in share_data.scenes_renamed:
-        scene_api.send_scene_renamed(share_data.client, old_name, new_name)
-        changed = True
-    return changed
-
-
-def remove_scenes():
-    changed = False
-    for scene in share_data.scenes_removed:
-        scene_api.send_scene_removed(share_data.client, scene)
         changed = True
     return changed
 
@@ -564,10 +571,12 @@ def create_vrtist_objects():
     VRtist will filter the received messages and handle only the objects that belong to the
     same scene as the one initially synchronized
     """
+    scene_objects = {x.name_full: x for x in bpy.context.scene.objects}
+
     changed = False
     for obj_name in share_data.objects_added:
-        if obj_name in bpy.context.scene.objects:
-            obj = bpy.context.scene.objects[obj_name]
+        obj = scene_objects.get(obj_name)
+        if obj:
             scene_api.send_add_object_to_vrtist(share_data.client, bpy.context.scene.name_full, obj.name_full)
             changed = True
     return changed
@@ -612,8 +621,9 @@ def update_objects_data():
             share_data.client.send_material(obj)
 
         if typename == "Scene":
-            update_frame_start_end()
             shot_manager.update_scene()
+
+    update_frame_start_end()
 
     # Send transforms
     for obj in transforms:
@@ -628,23 +638,35 @@ def update_objects_data():
             update_params(c)
 
 
-def send_animated_camera_data():
+def send_animated_data():
     animated_camera_set = set()
+    animated_light_set = set()
     camera_dict = {}
+    light_dict = {}
     depsgraph = bpy.context.evaluated_depsgraph_get()
     for update in depsgraph.updates:
         obj = update.id.original
         typename = obj.bl_rna.name
-        camera_action_name = ""
         if typename == "Object":
-            if obj.data and obj.data.bl_rna.name == "Camera" and obj.animation_data is not None:
-                camera_action_name = obj.animation_data.action.name_full
-                camera_dict[camera_action_name] = obj
-        if typename == "Action" and camera_dict.get(camera_action_name):
-            animated_camera_set.add(camera_dict[camera_action_name])
+            if obj.data and obj.data.animation_data is not None:
+                if obj.data.bl_rna.name == "Camera":
+                    camera_dict[obj.data.animation_data.action.name_full] = obj
+                if (
+                    obj.data.bl_rna.name == "Point Light"
+                    or obj.data.bl_rna.name == "Sun Light"
+                    or obj.data.bl_rna.name == "Spot Light"
+                ):
+                    light_dict[obj.data.animation_data.action.name_full] = obj
+        if typename == "Action":
+            if camera_dict.get(obj.name_full):
+                animated_camera_set.add(camera_dict[obj.name_full])
+            if light_dict.get(obj.name_full):
+                animated_light_set.add(light_dict[obj.name_full])
 
     for camera in animated_camera_set:
         share_data.client.send_camera_attributes(camera)
+    for light in animated_light_set:
+        share_data.client.send_light_attributes(light)
 
 
 def send_frame_changed(scene):
@@ -665,45 +687,35 @@ def send_frame_changed(scene):
         logger.debug("send_frame_changed canceled (not is_in_object_mode)")
         return
 
-    with StatsTimer(share_data, "send_frame_changed") as timer:
-        with timer.child("setFrame"):
-            if not share_data.client.block_signals:
-                share_data.client.send_frame(scene.frame_current)
+    if not share_data.client.block_signals:
+        share_data.client.send_frame(scene.frame_current)
 
-        with timer.child("clear_lists"):
-            share_data.clear_changed_frame_related_lists()
+    share_data.clear_changed_frame_related_lists()
 
-        with timer.child("update_frame_changed_related_objects_state"):
-            update_frame_changed_related_objects_state(share_data.old_objects, share_data.blender_objects)
+    update_frame_changed_related_objects_state(share_data.old_objects, share_data.blender_objects)
 
-        with timer.child("checkForChangeAndSendUpdates"):
-            update_objects_transforms()
+    update_objects_transforms()
 
-        # update for next change
-        with timer.child("update_objects_info"):
-            share_data.update_objects_info()
+    # update for next change
+    share_data.update_objects_info()
 
-        # temporary code :
-        # animated parameters are not sent, we need camera animated parameters for VRtist
-        # (focal lens etc.)
-        # please remove this when animation is managed
-        with timer.child("send_animated_camera_data"):
-            send_animated_camera_data()
+    # temporary code :
+    # animated parameters are not sent, we need camera & light animated parameters for VRtist
+    # (focal lens etc.)
+    # please remove this when animation is managed
+    send_animated_data()
 
-        with timer.child("send_current_camera"):
-            scene_camera_name = ""
-            if bpy.context.scene.camera is not None:
-                scene_camera_name = bpy.context.scene.camera.name_full
+    scene_camera_name = ""
+    if bpy.context.scene.camera is not None:
+        scene_camera_name = bpy.context.scene.camera.name_full
 
-            if share_data.current_camera != scene_camera_name:
-                share_data.current_camera = scene_camera_name
-                share_data.client.send_current_camera(share_data.current_camera)
+    if share_data.current_camera != scene_camera_name:
+        share_data.current_camera = scene_camera_name
+        share_data.client.send_current_camera(share_data.current_camera)
 
-        with timer.child("send_shot_manager_current_shot"):
-            shot_manager.send_frame()
+        shot_manager.send_frame()
 
 
-@stats_timer(share_data)
 def send_scene_data_to_server(scene, dummy):
     logger.debug(
         "send_scene_data_to_server(): skip_next_depsgraph_update %s, pending_test_update %s",
@@ -711,15 +723,12 @@ def send_scene_data_to_server(scene, dummy):
         share_data.pending_test_update,
     )
 
-    timer = share_data.current_stats_timer
-
     if not share_data.client:
         logger.info("send_scene_data_to_server canceled (no client instance)")
         return
 
     share_data.set_dirty()
-    with timer.child("clear_lists"):
-        share_data.clear_lists()
+    share_data.clear_lists()
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     if depsgraph.updates:
@@ -736,75 +745,46 @@ def send_scene_data_to_server(scene, dummy):
     share_data.pending_test_update = False
 
     if not is_in_object_mode():
-        logger.info("send_scene_data_to_server canceled (not is_in_object_mode)")
+        if depsgraph.updates:
+            logger.info("send_scene_data_to_server canceled (not is_in_object_mode). Skipping updates")
+            for update in depsgraph.updates:
+                logger.info(" ......%s", update.id.original)
         return
 
     update_object_state(share_data.old_objects, share_data.blender_objects)
 
-    with timer.child("update_scenes_state"):
-        update_scenes_state()
+    update_scenes_state()
 
-    with timer.child("update_collections_state"):
-        update_collections_state()
+    update_collections_state()
 
     changed = False
-    with timer.child("checkForChangeAndSendUpdates"):
-        changed |= remove_objects_from_collections()
-        changed |= remove_objects_from_scenes()
-        changed |= remove_collections_from_collections()
-        changed |= remove_collections_from_scenes()
-        changed |= remove_collections()
-        changed |= remove_scenes()
-        changed |= add_scenes()
-        changed |= add_collections()
-        changed |= add_objects()
-
-        # Updates from the VRtist protocol and from the full Blender protocol must be cafully intermixed
-        # This is an unfortunate requirements from the current coexistence status of
-        # both protocols
-
-        # After creation of meshes : meshes are not yet supported by full Blender protocol,
-        # but needed to properly create objects
-        # Before creation of objects :  the VRtint protocol  will implicitely create objects with
-        # unappropriate default values (e.g. transform creates an object with no data)
-        if share_data.use_experimental_sync():
-            # Compute the difference between the proxy state and the Blender state
-            # It is a coarse difference at the ID level(created, removed, renamed)
-            diff = BpyBlendDiff()
-            diff.diff(share_data.proxy, safe_context)
-
-            # Ask the proxy to compute the list of elements to synchronize and update itself
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            updates, removals = share_data.proxy.update(diff, safe_context, depsgraph.updates)
-
-            # Send the data update messages (includes serialization)
-            data_api.send_data_removals(removals)
-            data_api.send_data_updates(updates)
-            share_data.proxy.debug_check_id_proxies()
-
-        # send the VRtist transforms after full Blender protocol has the opportunity to create the object data
-        # that is not handled by VRtist protocol, otherwise the receiver creates an empty when it receives a transform
-        changed |= update_transforms()
-        changed |= add_collections_to_scenes()
-        changed |= add_collections_to_collections()
-        changed |= add_objects_to_collections()
-        changed |= add_objects_to_scenes()
-        changed |= update_collections_parameters()
-        changed |= create_vrtist_objects()
-        changed |= delete_scene_objects()
-        changed |= rename_objects()
-        changed |= update_objects_visibility()
-        changed |= update_objects_transforms()
-        changed |= reparent_objects()
-        changed |= shot_manager.check_montage_mode()
+    changed |= remove_objects_from_collections()
+    changed |= remove_objects_from_scenes()
+    changed |= remove_collections_from_collections()
+    changed |= remove_collections_from_scenes()
+    changed |= remove_collections()
+    changed |= add_scenes()
+    changed |= add_collections()
+    changed |= add_objects()
+    changed |= update_transforms()
+    changed |= add_collections_to_scenes()
+    changed |= add_collections_to_collections()
+    changed |= add_objects_to_collections()
+    changed |= add_objects_to_scenes()
+    changed |= update_collections_parameters()
+    changed |= create_vrtist_objects()
+    changed |= delete_scene_objects()
+    changed |= rename_objects()
+    changed |= update_objects_visibility()
+    changed |= update_objects_transforms()
+    changed |= reparent_objects()
+    changed |= shot_manager.check_montage_mode()
 
     if not changed:
-        with timer.child("update_objects_data"):
-            update_objects_data()
+        update_objects_data()
 
     # update for next change
-    with timer.child("update_current_data"):
-        share_data.update_current_data()
+    share_data.update_current_data()
 
     logger.debug("send_scene_data_to_server: end")
 
@@ -842,7 +822,6 @@ def remap_objects_info():
     share_data.old_objects = share_data.blender_objects
 
 
-@stats_timer(share_data)
 @persistent
 def handler_on_undo_redo_post(scene, dummy):
     logger.info("on_undo_redo_post")
@@ -870,7 +849,6 @@ def handler_on_undo_redo_post(scene, dummy):
     remove_collections_from_collections()
 
     remove_collections()
-    remove_scenes()
     add_scenes()
     add_objects()
     add_collections()

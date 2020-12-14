@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 Logging utility methods and classes
 """
@@ -5,8 +22,6 @@ Logging utility methods and classes
 import logging
 from pathlib import Path
 import os
-import traceback
-from typing import Callable
 
 from mixer.os_utils import getuser
 
@@ -26,8 +41,13 @@ class Formatter(logging.Formatter):
         - to append "./" at the begining to permit going to the line quickly with VS Code CTRL+click from terminal
         """
         s = super().format(record)
-        pathname = Path(record.pathname).relative_to(MODULE_PATH)
-        s += f" [{os.curdir}{os.sep}{pathname}:{record.lineno}]"
+        path = Path(record.pathname)
+        try:
+            path = path.relative_to(MODULE_PATH)
+        except ValueError:
+            pass
+
+        s += f" [{os.curdir}{os.sep}{path}:{record.lineno}]"
         return s
 
 
@@ -55,8 +75,3 @@ def get_log_file():
     from mixer.share_data import share_data
 
     return os.path.join(get_logs_directory(), f"mixer_logs_{share_data.run_id}.log")
-
-
-def log_traceback(log_func: Callable[[str], None]):
-    for line in traceback.format_exc().splitlines():
-        log_func(line)

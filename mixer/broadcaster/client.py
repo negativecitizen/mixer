@@ -1,9 +1,32 @@
+# MIT License
+#
+# Copyright (c) 2020 Ubisoft
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import socket
 import logging
 import time
 from typing import Dict, Any, Mapping, Optional, List, Callable
 
 import mixer.broadcaster.common as common
+from mixer.broadcaster.socket import Socket
 from mixer.broadcaster.common import MessageType
 from mixer.broadcaster.common import update_attributes_and_get_diff, update_named_attributes
 
@@ -19,11 +42,11 @@ class Client:
     - maintain an updated view of clients and room states from server's inputs
     """
 
-    def __init__(self, host=common.DEFAULT_HOST, port=common.DEFAULT_PORT):
+    def __init__(self, host: str = common.DEFAULT_HOST, port: int = common.DEFAULT_PORT):
         self.host = host
         self.port = port
         self.pending_commands: List[common.Command] = []
-        self.socket = None
+        self.socket: Socket = None
 
         self.client_id: Optional[str] = None  # Will be filled with a unique string identifying this client
         self.current_custom_attributes: Dict[str, Any] = {}
@@ -48,11 +71,16 @@ class Client:
             raise RuntimeError("Client.connect : already connected")
 
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket = Socket(sock)
             self.socket.connect((self.host, self.port))
             local_address = self.socket.getsockname()
             logger.info(
-                "Connecting from local %s:%s to %s:%s", local_address[0], local_address[1], self.host, self.port,
+                "Connecting from local %s:%s to %s:%s",
+                local_address[0],
+                local_address[1],
+                self.host,
+                self.port,
             )
             self.send_command(common.Command(common.MessageType.CLIENT_ID))
             self.send_command(common.Command(common.MessageType.LIST_CLIENTS))
@@ -117,6 +145,9 @@ class Client:
     def delete_room(self, room_name: str):
         return self.send_command(common.Command(common.MessageType.DELETE_ROOM, room_name.encode("utf8"), 0))
 
+    def send_error(self, message: str):
+        return self.send_command(common.Command(common.MessageType.SEND_ERROR, common.encode_string(message), 0))
+
     def set_client_attributes(self, attributes: dict):
         diff = update_attributes_and_get_diff(self.current_custom_attributes, attributes)
         if diff == {}:
@@ -177,8 +208,13 @@ class Client:
     def _handle_join_room(self, command: common.Command):
         room_name, _ = common.decode_string(command.data, 0)
 
-        logger.info("Join room %s confirmed by server", room_name)
+        logger.info("Info: Join room '%s' confirmed by server", room_name)
         self.current_room = room_name
+
+    def _handle_send_error(self, command: common.Command):
+        error_message, _ = common.decode_string(command.data, 0)
+
+        logger.error("Received error message : %s", error_message)
 
     _default_command_handlers: Mapping[MessageType, Callable[[common.Command], None]] = {
         MessageType.LIST_CLIENTS: _handle_list_client,
@@ -189,6 +225,7 @@ class Client:
         MessageType.CLIENT_UPDATE: _handle_client_update,
         MessageType.CLIENT_DISCONNECTED: _handle_client_disconnected,
         MessageType.JOIN_ROOM: _handle_join_room,
+        MessageType.SEND_ERROR: _handle_send_error,
     }
 
     def has_default_handler(self, message_type: MessageType):

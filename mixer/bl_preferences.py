@@ -1,3 +1,20 @@
+# GPLv3 License
+#
+# Copyright (C) 2020 Ubisoft
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 This module defines Blender Preferences for the addon.
 """
@@ -13,7 +30,7 @@ from mixer.broadcaster import common
 from mixer.broadcaster.common import ClientAttributes
 from mixer.os_utils import getuser
 from mixer.share_data import share_data
-from mixer.stats import get_stats_directory
+from mixer.local_data import get_data_directory
 
 logger = logging.getLogger(__name__)
 
@@ -60,16 +77,11 @@ class MixerPreferences(bpy.types.AddonPreferences):
         update=update_panels_category,
     )
 
-    # Allows to change behavior according to environment: production or development
-    env: bpy.props.EnumProperty(
-        name="Execution Environment",
-        description="Execution environment: production, development or testing",
-        items=[
-            ("production", "production", "", 0),
-            ("development", "development", "", 1),
-            ("testing", "testing", "", 2),
-        ],
-        default=os.environ.get("MIXER_ENV", "production"),
+    vrtist_category: bpy.props.StringProperty(
+        name="Tab Category",
+        description="VRtist Panel.",
+        default=os.environ.get("VRTIST_CATEGORY", "VRtist"),
+        update=update_panels_category,
     )
 
     host: bpy.props.StringProperty(name="Host", default=os.environ.get("VRTIST_HOST", common.DEFAULT_HOST))
@@ -98,8 +110,8 @@ class MixerPreferences(bpy.types.AddonPreferences):
         get=get_log_level,
     )
 
-    experimental_sync: bpy.props.BoolProperty(
-        name="Experimental sync", default=os.environ.get("MIXER_EXPERIMENTAL_SYNC") is not None
+    vrtist_protocol: bpy.props.BoolProperty(
+        name="VRtist Protocol", default=os.environ.get("MIXER_VRTIST_PROTOCOL") == "0"
     )
 
     show_server_console: bpy.props.BoolProperty(name="Show Server Console", default=False)
@@ -107,16 +119,18 @@ class MixerPreferences(bpy.types.AddonPreferences):
     VRtist: bpy.props.StringProperty(
         name="VRtist", default=os.environ.get("VRTIST_EXE", "D:/unity/VRtist/Build/VRtist.exe"), subtype="FILE_PATH"
     )
-    statistics_directory: bpy.props.StringProperty(
-        name="Stats Directory", default=os.environ.get("MIXER_STATS_DIR", get_stats_directory()), subtype="FILE_PATH"
+
+    data_directory: bpy.props.StringProperty(
+        name="Data Directory", default=os.environ.get("MIXER_DATA_DIR", get_data_directory()), subtype="FILE_PATH"
     )
-    auto_save_statistics: bpy.props.BoolProperty(default=True)
 
     # Developer option to avoid sending scene content to server at the first connexion
     # Allow to quickly iterate debugging/test on large scenes with only one client in room
     # Main usage: optimization of client timers to check if updates are required
     no_send_scene_content: bpy.props.BoolProperty(default=False)
-
+    no_start_server: bpy.props.BoolProperty(
+        name="Do not start server", default=os.environ.get("MIXER_NO_START_SERVER") is not None
+    )
     send_base_meshes: bpy.props.BoolProperty(default=True)
     send_baked_meshes: bpy.props.BoolProperty(default=True)
 
