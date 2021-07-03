@@ -25,6 +25,8 @@ import logging
 import traceback
 from typing import List, TYPE_CHECKING
 
+import bpy
+
 from mixer.blender_data.json_codec import Codec, DecodeError, EncodeError
 from mixer.blender_data.messages import (
     BlenderDataMessage,
@@ -48,7 +50,8 @@ logger = logging.getLogger(__name__)
 
 def send_media_creations(proxy: DatablockProxy):
     bytes_ = BlenderMediaMessage.encode(proxy)
-    if bytes_:
+    if bytes_ and proxy._media:
+        logger.info("send_media_creations %s: %d bytes", proxy._media[0], len(bytes_))
         command = Command(MessageType.BLENDER_DATA_MEDIA, bytes_, 0)
         share_data.client.add_command(command)
 
@@ -58,6 +61,7 @@ def build_data_media(buffer: bytes):
     # The packed data with be saved to file, not a problem
     message = BlenderMediaMessage()
     message.decode(buffer)
+    logger.info("build_data_media %s: %d bytes", message.path, len(message.bytes_))
     # TODO this does not overwrite outdated local files
     get_local_or_create_cache_file(message.path, message.bytes_)
 
@@ -94,7 +98,7 @@ def send_data_updates(updates: UpdateChangeset):
 
     codec = Codec()
     for update in updates:
-        logger.info("%s %s", "send_data_update", update)
+        logger.debug("%s %s", "send_data_update", update)
 
         try:
             encoded_update = codec.encode(update)
@@ -143,14 +147,24 @@ def build_data_create(buffer):
 
 
 def _build_soas(uuid: Uuid, soas: List[Soa]):
+    update = False
     try:
         for soa in soas:
-            share_data.bpy_data_proxy.update_soa(uuid, soa.path, soa.members)
+            update |= share_data.bpy_data_proxy.update_soa(uuid, soa.path, soa.members)
     except Exception:
+        # Partial update of arrays may cause data length mismatch between array elements (co, normals, ...)
         logger.error(f"Exception during update_soa for {uuid} {soa.path}")
+        logger.error(" -------  This may cause a Blender crash ---------")
         for line in traceback.format_exc().splitlines():
             logger.error(line)
-        logger.error("ignored")
+
+    if update:
+        # TODO this is skipped if the proxy update call is retained until returning into OBJECT mode
+        try:
+            # needed for Grease Pencil.
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
 
 
 def build_data_update(buffer: bytes):
@@ -163,7 +177,7 @@ def build_data_update(buffer: bytes):
         message = BlenderDataMessage()
         message.decode(buffer)
         delta: Delta = codec.decode(message.proxy_string)
-        logger.info("%s: %s", "build_data_update", delta)
+        logger.debug("%s: %s", "build_data_update", delta)
         delta.value.arrays = message.arrays
         share_data.bpy_data_proxy.update_datablock(delta)
 
@@ -172,8 +186,9 @@ def build_data_update(buffer: bytes):
             _build_soas(datablock_proxy.mixer_uuid, message.soas)
 
     except DecodeError as e:
-        logger.error(f"Decode error for {str(e.args[1])[:100]} ...")
-        logger.error("... possible version mismatch")
+        logger.error(f"Decode error for {str(e.args[1])[:100]} . Possible causes...")
+        logger.error("... user error: version mismatch")
+        logger.error("... internal error: Proxy class not registered. Import it in blender_data.__init__.py")
     except Exception:
         logger.error("Exception during build_data_update")
         for line in traceback.format_exc().splitlines():
@@ -190,7 +205,7 @@ def send_data_removals(removals: RemovalChangeset):
         return
 
     for uuid, _, debug_info in removals:
-        logger.warning("send_removal: %s (%s)", uuid, debug_info)
+        logger.info("send_removal: %s (%s)", uuid, debug_info)
         buffer = BlenderRemoveMessage.encode(uuid, debug_info)
         command = Command(MessageType.BLENDER_DATA_REMOVE, buffer, 0)
         share_data.client.add_command(command)
@@ -202,7 +217,7 @@ def build_data_remove(buffer):
 
     message = BlenderRemoveMessage()
     message.decode(buffer)
-    logger.warning("build_data_remove: %s (%s)", message.uuid, message.debug_info)
+    logger.info("build_data_remove: %s (%s)", message.uuid, message.debug_info)
     share_data.bpy_data_proxy.remove_datablock(message.uuid)
 
     # TODO temporary until VRtist protocol uses Blenddata instead of blender_objects & co
@@ -239,7 +254,7 @@ def build_data_rename(buffer):
     items = list(itertools.zip_longest(*args))
 
     for uuid, old_name, new_name in items:
-        logger.warning("build_data_rename: %s (%s) into %s", uuid, old_name, new_name)
+        logger.info("build_data_rename: %s (%s) into %s", uuid, old_name, new_name)
 
     rename_changeset = share_data.bpy_data_proxy.rename_datablocks(items)
 

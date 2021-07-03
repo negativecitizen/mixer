@@ -13,9 +13,23 @@ _set_log_level = """
 from mixer.bl_preferences import set_log_level
 set_log_level(None, {log_level})
 """
+
+# wait a bit for the server to get started
 _connect = """
 import bpy
-bpy.ops.mixer.connect()
+import time
+timeout = 10
+end_time = time.monotonic() + timeout
+while True:
+    try:
+        bpy.ops.mixer.connect()
+    except RuntimeError as e:
+        print ("Connect failed, retry", repr(e))
+        if time.monotonic() > end_time:
+            raise
+        time.sleep(0.1)
+    else:
+        break
 """
 
 _disconnect = """
@@ -25,24 +39,24 @@ bpy.ops.mixer.disconnect()
 
 _create_room = """
 from mixer.connection import join_room
-join_room("{room_name}", {vrtist_protocol})
+join_room("{room_name}", {vrtist_protocol}, {shared_folders}, True)
 """
 
 _keep_room_open = """
 from mixer.share_data import share_data
 share_data.client.set_room_keep_open("{room_name}", {keep_room_open})
 """
-_set_workspace = """
-from mixer.tructruc import set_workspace
-set_workspace({workspace_folders})
-"""
+
 _join_room = """
+import mixer.blender_data
 from mixer.connection import join_room
 from mixer.broadcaster.common import RoomAttributes
 from mixer.share_data import share_data
 from mixer.blender_client.client import clear_scene_content
 import sys
 import time
+
+mixer.blender_data.register()
 
 # prevent sending our contents in case of cross join. Easier to diagnose the problem
 clear_scene_content()
@@ -63,7 +77,7 @@ def wait_joinable():
     return room_attributes is not None and room_attributes.get(RoomAttributes.JOINABLE, False)
 
 if wait_joinable():
-    join_room("{room_name}", {vrtist_protocol})
+    join_room("{room_name}", {vrtist_protocol}, {shared_folders}, True)
 else:
     print(f"ERROR: Cannot join room after {max_wait} seconds. Abort")
     time.sleep(5)
@@ -99,14 +113,16 @@ class BlenderApp:
         room_name="mixer_unittest",
         keep_room_open=False,
         vrtist_protocol: bool = False,
-        workspace_folders: List[str] = (),
+        ignore_version_check=True,
+        shared_folders: List[str] = (),
     ):
         """Emit a mixer create room command"""
-        if workspace_folders:
-            set_workspaces = _set_workspace.format(workspace_folders=list(workspace_folders))
-            self._blender.send_string(set_workspaces)
-
-        create_room = _create_room.format(room_name=room_name, vrtist_protocol=vrtist_protocol)
+        create_room = _create_room.format(
+            room_name=room_name,
+            vrtist_protocol=vrtist_protocol,
+            shared_folders=list(shared_folders),
+            ignore_version_check=ignore_version_check,
+        )
         self._blender.send_string(create_room)
 
         keep_room_open = _keep_room_open.format(room_name=room_name, keep_room_open=keep_room_open)
@@ -116,13 +132,17 @@ class BlenderApp:
         self,
         room_name="mixer_unittest",
         vrtist_protocol: bool = False,
-        workspace_folders: Iterable[str] = (),
+        shared_folders: Iterable[str] = (),
+        ignore_version_check=True,
     ):
         """Emit a mixer join room command"""
-        if workspace_folders:
-            set_workspaces = _set_workspace.format(workspace_folders=list(workspace_folders))
-            self._blender.send_string(set_workspaces)
-        join_room = _join_room.format(room_name=room_name, vrtist_protocol=vrtist_protocol, max_wait="{max_wait}")
+        join_room = _join_room.format(
+            room_name=room_name,
+            vrtist_protocol=vrtist_protocol,
+            shared_folders=list(shared_folders),
+            ignore_version_check=ignore_version_check,
+            max_wait="{max_wait}",
+        )
         self._blender.send_string(join_room)
 
     def disconnect_mixer(self):

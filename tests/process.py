@@ -173,7 +173,10 @@ class BlenderServer(BlenderProcess):
 
         # anti-virus might delay if Blender is launched for the first time
         # allow time to attach debugger
-        max_wait = 120
+        if self._wait_for_debugger:
+            max_wait = sys.maxsize
+        else:
+            max_wait = 20
 
         start = time.monotonic()
         while not connected and time.monotonic() - start < max_wait:
@@ -278,7 +281,7 @@ class ServerProcess(PythonProcess):
 
         args = ["-m", "mixer.broadcaster.apps.server"]
         args.extend(["--port", str(self.port)])
-        args.extend(["--log-level", "INFO"])
+        args.extend(["--log-level", "WARNING"])
         if server_args:
             args.extend(server_args)
         super().start(args)

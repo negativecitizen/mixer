@@ -25,33 +25,49 @@ see synchronization.md
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
+import sys
 from typing import Any, Dict, ItemsView, Iterable, List, Optional, Set, Union
 
 from bpy import types as T  # noqa
 
 from mixer.blender_data.type_helpers import is_pointer_to
-from mixer.blender_data.blenddata import collection_name_to_type
+from mixer.blender_data.bpy_data import collections_names
 
 DEBUG = True
 logger = logging.getLogger(__name__)
 
 
+def _skip_scene(item):
+    return item.name == "_mixer_to_be_removed_"
+
+
+def _skip_image(item):
+    return item.source == "VIEWER"
+
+
+def _skip_skape_key(item):
+    # shape keys are not linkable, they can only be linked indirectly via a Mesh or other
+    return item.library is not None
+
+
+_skip = {"scenes": _skip_scene, "images": _skip_image, "shape_keys": _skip_skape_key}
+
+
 def skip_bpy_data_item(collection_name, item):
     # Never want to consider these as updated, created, removed, ...
-    if collection_name == "scenes":
-        if item.name == "_mixer_to_be_removed_":
-            return True
-    elif collection_name == "images":
-        if item.source == "VIEWER":
-            # "Render Result", "Viewer Node"
-            return True
-    return False
+    try:
+        skip = _skip[collection_name]
+    except KeyError:
+        return False
+    else:
+        return skip(item)
 
 
 class Filter:
     def apply(self, properties):
-        return properties
+        return properties, ""
 
     def is_active(self):
         return True
@@ -65,35 +81,26 @@ class TypeFilter(Filter):
     """
 
     def __init__(self, types: Union[Any, Iterable[Any]]):
-        types = types if isinstance(types, Iterable) else [types]
-        self._types: Iterable[Any] = [t.bl_rna for t in types]
+        self._types = types if isinstance(types, Iterable) else [types]
+
+    # use cached_property in 3.8
+    @property  # type: ignore
+    @lru_cache()
+    def _rnas(self):
+        return [t.bl_rna for t in self._types]
 
     def matches(self, bl_rna_property):
-        return bl_rna_property.bl_rna in self._types or any([is_pointer_to(bl_rna_property, t) for t in self._types])
+        return bl_rna_property.bl_rna in self._rnas or any([is_pointer_to(bl_rna_property, t) for t in self._rnas])
 
 
 class TypeFilterIn(TypeFilter):
     def apply(self, properties):
-        return [p for p in properties if self.matches(p)]
+        return [p for p in properties if self.matches(p)], ""
 
 
 class TypeFilterOut(TypeFilter):
     def apply(self, properties):
-        return [p for p in properties if not self.matches(p)]
-
-
-class CollectionFilterOut(TypeFilter):
-    def apply(self, properties):
-        # srna looks like the type inside the collection
-        return [
-            p
-            for p in properties
-            if p.bl_rna is not T.CollectionProperty.bl_rna or p.srna and p.srna.bl_rna not in self._types
-        ]
-
-
-class FuncFilterOut(Filter):
-    pass
+        return [p for p in properties if not self.matches(p)], ""
 
 
 class NameFilter(Filter):
@@ -101,25 +108,24 @@ class NameFilter(Filter):
         self._names = names
 
     def check_unknown(self, properties):
+        if not DEBUG:
+            return None
         identifiers = [p.identifier for p in properties]
         local_exclusions = set(self._names) - set(_exclude_names)
-        unknowns = [name for name in local_exclusions if name not in identifiers]
-        for unknown in unknowns:
-            logger.warning(f"Internal error: Filtering unknown property {unknown}. Check spelling")
+        unknowns = [repr(name) for name in local_exclusions if name not in identifiers]
+        if unknowns:
+            return f"Unknown properties: {', '.join(unknowns)}. Check spelling"
+        return ""
 
 
 class NameFilterOut(NameFilter):
     def apply(self, properties):
-        if DEBUG:
-            self.check_unknown(properties)
-        return [p for p in properties if p.identifier not in self._names]
+        return [p for p in properties if p.identifier not in self._names], self.check_unknown(properties)
 
 
 class NameFilterIn(NameFilter):
     def apply(self, properties):
-        if DEBUG:
-            self.check_unknown(properties)
-        return [p for p in properties if p.identifier in self._names]
+        return [p for p in properties if p.identifier in self._names], self.check_unknown(properties)
 
 
 # true class with isactive()
@@ -136,20 +142,32 @@ def bases(bl_rna):
 
 class FilterStack:
     def __init__(self):
-        self._filter_stack: List[FilterSet] = []
+        self._filter_sets: List[FilterSet] = []
+
+    @lru_cache()
+    def _filter_stack(self):
+        filters = []
+        for filter_set in self._filter_sets:
+            filters.append({None if k is None else k.bl_rna: v for k, v in filter_set.items()})
+        return filters
 
     def apply(self, bl_rna: T.bpy_struct) -> List[T.Property]:
         properties = list(bl_rna.properties)
         for class_ in bases(bl_rna):
             bl_rna = None if class_ is None else class_.bl_rna
-            for filter_set in self._filter_stack:
+            for filter_set in self._filter_stack():
                 filters = filter_set.get(bl_rna, [])
                 for filter_ in filters:
-                    properties = filter_.apply(properties)
+                    properties, error = filter_.apply(properties)
+                    if error:
+                        logger.error(
+                            f"Error while applying filter {filter_.__class__.__name__!r} on {bl_rna.identifier!r} ..."
+                        )
+                        logger.error(f"... {error}")
         return properties
 
     def append(self, filter_set: FilterSet):
-        self._filter_stack.append({None if k is None else k.bl_rna: v for k, v in filter_set.items()})
+        self._filter_sets.append(filter_set)
 
 
 BlRna = Any
@@ -170,22 +188,31 @@ class SynchronizedProperties:
     and never unloaded
     """
 
-    def __init__(self, filter_stack, order: PropertiesOrder):
+    def __init__(self, filter_stack, properties_order: PropertiesOrder):
         self._properties: Dict[BlRna, Properties] = {}
         self._filter_stack: FilterStack = filter_stack
         self._unhandled_bpy_data_collection_names: Optional[List[str]] = None
-        self._order = {k.bl_rna: v for k, v in order.items()}
+        self._properties_order = properties_order
+
+    @lru_cache()
+    def _order(self):
+        return {k.bl_rna: v for k, v in self._properties_order.items()}
 
     def _sort(self, bl_rna, properties: List[T.Property]):
-        try:
-            order = self._order[bl_rna]
-        except KeyError:
+
+        for class_ in bases(bl_rna):
+            bl_rna = None if class_ is None else class_.bl_rna
+            ordered_identifiers = self._order().get(bl_rna)
+            if ordered_identifiers is not None:
+                break
+
+        if not ordered_identifiers:
             return properties
 
+        identifier_order = {identifier: i for i, identifier in enumerate(ordered_identifiers)}
+
         def predicate(prop: T.Property):
-            if prop.identifier in order:
-                return 0
-            return 1
+            return identifier_order.get(prop.identifier, sys.maxsize)
 
         return sorted(properties, key=predicate)
 
@@ -216,7 +243,7 @@ class SynchronizedProperties:
         """
         if self._unhandled_bpy_data_collection_names is None:
             handled = {item[0] for item in self.properties(bpy_type=T.BlendData)}
-            self._unhandled_bpy_data_collection_names = list(collection_name_to_type.keys() - handled)
+            self._unhandled_bpy_data_collection_names = list(collections_names() - handled)
 
         return self._unhandled_bpy_data_collection_names
 
@@ -226,8 +253,6 @@ test_filter = FilterStack()
 blenddata_exclude = [
     # "brushes" generates harmless warnings when EnumProperty properties are initialized with a value not in the enum
     "brushes",
-    # TODO actions require to handle the circular reference between ActionGroup.channel and FCurve.group
-    "actions",
     # we do not need those
     "screens",
     "window_managers",
@@ -255,6 +280,7 @@ _exclude_names = [
     "override_library",
     "preview",
     "rna_type",
+    "select",
     "tag",
     "type_info",
     "users",
@@ -268,7 +294,41 @@ default_exclusions: FilterSet = {
         TypeFilterOut(T.PoseBone),
         NameFilterOut(_exclude_names),
     ],
-    T.ActionGroup: [NameFilterOut(["channels"])],
+    T.Action: [
+        NameFilterOut(
+            # Read only
+            ["frame_range"]
+        )
+    ],
+    T.ActionGroup: [
+        NameFilterOut(
+            [
+                # a view into FCurve.group
+                "channels",
+                # UI
+                "show_expanded",
+                "show_expanded_graph",
+            ]
+        )
+    ],
+    T.Armature: [
+        NameFilterOut(
+            [
+                # A non editable view of edit_bones
+                "bones",
+                # hardcoded in ArmatureProxy
+                "edit_bones",
+            ]
+        )
+    ],
+    T.AttributeGroup: [
+        NameFilterOut(
+            [
+                # UI
+                "active",
+            ]
+        )
+    ],
     T.BezierSplinePoint: [
         NameFilterOut(
             [
@@ -279,17 +339,38 @@ default_exclusions: FilterSet = {
         )
     ],
     T.BlendData: [NameFilterOut(blenddata_exclude), TypeFilterIn(T.CollectionProperty)],  # selected collections
-    # makes a loop
-    T.Bone: [NameFilterOut(["parent"])],
-    # TODO temporary ?
+    T.Bone: [
+        NameFilterOut(
+            [
+                "parent",
+            ]
+        )
+    ],
     T.Collection: [NameFilterOut(["all_objects"])],
     T.CompositorNodeRLayers: [NameFilterOut(["scene"])],
-    T.CurveMapPoint: [NameFilterOut(["select"])],
-    # TODO this avoids the recursion path Node.socket , NodeSocker.Node
-    # can probably be included in the readonly filter
-    # TODO temporary ? Restore after foreach_get()
+    T.Curve: [NameFilterOut(["shape_keys"])],
     T.DecimateModifier: [NameFilterOut(["face_count"])],
+    T.EditBone: [
+        NameFilterOut(
+            [
+                # UI
+                "select",
+                "select_head",
+                "select_tail",
+            ]
+        )
+    ],
     T.FaceMap: [NameFilterOut(["index"])],
+    T.Keyframe: [
+        NameFilterOut(
+            [
+                # UI
+                "select_control_point",
+                "select_right_handle",
+                "select_left_handle",
+            ]
+        )
+    ],
     T.Image: [
         NameFilterOut(
             [
@@ -348,6 +429,15 @@ default_exclusions: FilterSet = {
             ]
         )
     ],
+    T.Library: [
+        NameFilterOut(
+            [
+                "parent",
+                "version",
+                # "users_id",
+            ]
+        )
+    ],
     T.MaterialSlot: [
         NameFilterOut(
             [
@@ -375,25 +465,26 @@ default_exclusions: FilterSet = {
             ]
         )
     ],
-    T.MeshEdge: [NameFilterOut(["select"])],
     T.MeshLoopColorLayer: [NameFilterOut(["active"])],
-    T.MeshPolygon: [NameFilterOut(["area", "center", "normal", "select"])],
-    T.MeshUVLoop: [NameFilterOut(["select"])],
+    T.MeshPolygon: [NameFilterOut(["area", "center", "normal"])],
     T.MeshUVLoopLayer: [NameFilterOut(["active", "active_clone"])],
     T.MeshVertex: [
         NameFilterOut(
             [
-                "select",
                 # MeshVertex.groups is updated via Object.vertex_groups
                 "groups",
             ]
         )
     ],
-    #
+    T.Modifier: [
+        # UI
+        NameFilterOut(["is_active"])
+    ],
     T.Node: [
         NameFilterOut(
             [
                 "internal_links",
+                "type",
                 # cannot be written: set by shader editor
                 "dimensions",
             ]
@@ -404,16 +495,30 @@ default_exclusions: FilterSet = {
         NameFilterOut(["is_hidden"])
     ],
     T.NodeSocket: [
+        NameFilterOut(
+            [
+                # XxxNodeGroup save will modify other XxxShaderNode socker identifier !
+                "identifier",
+                # readonly
+                "is_linked",
+                "is_output",
+                "label",
+                "node",
+                "type",
+            ]
+        )
+    ],
+    T.NodeSocketInterface: [
         # Currently synchronize builtin shading node sockets only, so assume these attributes are
         # managed only at the Node creation
-        # NameFilterOut(["identifier", "is_linked", "is_output", "link_limit", "name", "node", "type"])
-        NameFilterOut(["bl_idname", "is_linked", "is_output", "node"])
+        NameFilterOut(["identifier", "is_output", "type"])
     ],
     T.NodeTree: [
         NameFilterOut(
             [
                 # read only
                 "view_center",
+                "type",
             ]
         )
     ],
@@ -437,6 +542,14 @@ default_exclusions: FilterSet = {
                 "field",
                 # TODO
                 "particle_systems",
+                # unsupported
+                "motion_path",
+                "proxy_collection",
+                "proxy",
+                "soft_body",
+                "rigid_body",
+                "rigid_body_constraint",
+                "image_user",
             ]
         )
     ],
@@ -456,6 +569,25 @@ default_exclusions: FilterSet = {
             ]
         )
     ],
+    T.PoseBone: [
+        NameFilterOut(
+            [
+                # views into Armature.bones items
+                "bone",
+                "child",
+                "parent",
+                # computed from TRS, and vice versa
+                "matrix",
+                "matrix_basis",
+                # readonly
+                "head",
+                "is_in_ik_chain",
+                "length",
+                "matrix_channel",
+                "tail",
+            ]
+        )
+    ],
     T.RenderSettings: [
         NameFilterOut(
             [
@@ -463,12 +595,20 @@ default_exclusions: FilterSet = {
                 "stereo_views",
                 # Causes error in pass_filter, maybe not useful
                 "bake",
+                # Engine type (Eevee, Cycle...)
+                "engine",
             ]
         )
     ],
     T.Scene: [
         NameFilterOut(
             [
+                # each user should be able to view and render through the scene camera she chooses
+                "camera",
+                # Let each participant play his own time
+                "frame_current",
+                "frame_current_final",
+                "frame_float",
                 # messy in tests because setting either may reset the other to frame_start or frame_end
                 # would require
                 "frame_preview_start",
@@ -486,6 +626,12 @@ default_exclusions: FilterSet = {
                 # TODO
                 # a view into builtin U keying_sets ?
                 "keying_sets_all",
+                # ui: scene transform mode
+                "transform_orientation_slots",
+                # ui: user settings for viewport content manipulation
+                "tool_settings",
+                # ui: 3D cursor
+                "cursor",
             ]
         ),
     ],
@@ -498,11 +644,18 @@ default_exclusions: FilterSet = {
         )
     ],
     T.SequenceEditor: [NameFilterOut(["active_strip", "sequences_all"])],
+    T.ShaderNodeTree: [
+        NameFilterOut(
+            [
+                # UI
+                "active_input",
+            ]
+        )
+    ],
     T.ShapeKey: [
         NameFilterOut(
             [
                 "frame",
-                "relative_key",
             ]
         )
     ],
@@ -532,11 +685,35 @@ Per-type property exclusions
 
 
 property_order: PropertiesOrder = {
+    # Match closest parent type (e.g. NodeTree for ShaderNodeTree)
+    T.Action: {
+        # before fcurves
+        "groups",
+    },
     T.ColorManagedViewSettings: {
         "use_curve_mapping",
     },
+    T.DriverTarget: {
+        # before id
+        "id_type",
+    },
     T.Material: {
         "use_nodes",
+    },
+    T.NodeTree: {
+        # creating inputs and output create sockets on input and output nodes
+        # https://blender.stackexchange.com/questions/184447/how-to-update-nodesocketstring-value-inside-a-node-group-in-a-attribute-node-usi
+        "inputs",
+        "outputs",
+        # must exist before links are saved
+        "nodes",
+    },
+    T.PoseBone: {
+        "matrix",
+    },
+    T.Pose: {
+        # before bones
+        "bone_groups",
     },
     T.Scene: {
         # Required to save view_layers
@@ -553,25 +730,33 @@ property_order: PropertiesOrder = {
 }
 """Properties to deliver first because their value enables the possibility to write other attributes."""
 
+
 test_filter.append(default_exclusions)
 test_properties = SynchronizedProperties(test_filter, property_order)
 """For tests"""
 
 safe_depsgraph_updates = (
+    T.Action,
+    T.Armature,
     T.Camera,
     T.Collection,
     T.Curve,
+    # no updates, builtin font only
+    # T.VectorFont,
     T.Image,
     T.GreasePencil,
     T.Key,
+    T.Library,
     T.Light,
     T.Material,
     T.Mesh,
     T.MetaBall,
+    T.MovieClip,
     T.NodeTree,
     T.Object,
     T.Scene,
     T.Sound,
+    T.Texture,
     T.World,
 )
 """
@@ -583,19 +768,26 @@ See synchronization.md
 
 safe_filter = FilterStack()
 safe_blenddata_collections = [
+    "actions",
+    "armatures",
     "cameras",
     "collections",
     "curves",
+    "fonts",
     "grease_pencils",
     "images",
+    "libraries",
     "lights",
     "materials",
     "meshes",
     "metaballs",
+    "movieclips",
+    "node_groups",
     "objects",
     "scenes",
     "shape_keys",
     "sounds",
+    "textures",
     "worlds",
 ]
 """

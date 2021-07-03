@@ -34,6 +34,7 @@ import bpy.types as T  # noqa
 from mixer.blender_data.datablock_proxy import DatablockProxy
 from mixer.blender_data.filter import SynchronizedProperties, skip_bpy_data_item
 from mixer.blender_data.proxy import ensure_uuid
+from mixer.blender_data.library_proxies import DatablockLinkProxy
 
 if TYPE_CHECKING:
     from mixer.blender_data.bpy_data_proxy import BpyDataProxy
@@ -79,40 +80,74 @@ class BpyDataCollectionDiff:
         self._items_added.clear()
         self._items_removed.clear()
         self._items_renamed.clear()
-        proxies = {datablock_proxy.mixer_uuid: datablock_proxy for datablock_proxy in proxy._data.values()}
+
+        # Proxies for received image datablocks that failed to load because of a locally misconfigured shared folders do
+        # not have a datablock (they have one when loading the .blend file). Do not consider the proxies without
+        # datablock otherwise they would be found as deleted and removals would be sent to peers that may have
+        # them.
+        proxies = {
+            datablock_proxy.mixer_uuid: datablock_proxy
+            for datablock_proxy in proxy._data.values()
+            if datablock_proxy.has_datablock
+        }
         bl_collection = getattr(bpy.data, collection_name)
 
         # (item name, collection name)
         blender_items: Dict[Uuid, Tuple[T.ID, str]] = {}
-
+        conflicts: List[T.ID] = []
         for datablock in bl_collection.values():
             if skip_bpy_data_item(collection_name, datablock):
                 continue
 
             uuid = datablock.mixer_uuid
             if uuid in blender_items.keys():
-                # duplicate uuid, from an object duplication
-                duplicate_name, duplicate_collection_name = blender_items[uuid]
-                logger.info(
-                    f"Duplicate uuid {uuid} in bpy.data.{duplicate_collection_name} for {duplicate_name} and bpy.data.{collection_name} for {datablock.name_full}..."
-                )
-                logger.info("... assuming object was duplicated. Resetting (not an error)")
-                # reset the uuid, ensure will regenerate
-                datablock.mixer_uuid = ""
+                conflicts.append(datablock)
+            else:
+                ensure_uuid(datablock)
+                if datablock.mixer_uuid in blender_items.keys():
+                    logger.error(f"Duplicate uuid found for {datablock}")
+                    continue
 
-            ensure_uuid(datablock)
-            if datablock.mixer_uuid in blender_items.keys():
-                logger.error(f"Duplicate uuid found for {datablock}")
-                continue
+                blender_items[datablock.mixer_uuid] = (datablock, collection_name)
 
-            blender_items[datablock.mixer_uuid] = (datablock, collection_name)
+        for second_datablock in conflicts:
+            first_datablock = blender_items[second_datablock.mixer_uuid][0]
+            if first_datablock.library is None:
+                if second_datablock.library is None:
+                    # local/local : assume second is the new conflicting, from a copy paste
+                    second_datablock.mixer_uuid = ""
+                    ensure_uuid(second_datablock)
+                    blender_items[second_datablock.mixer_uuid] = (second_datablock, collection_name)
+                else:
+                    # local/linked: first is made_local from linked second
+                    first_datablock.mixer_uuid = ""
+                    ensure_uuid(first_datablock)
+                    blender_items[first_datablock.mixer_uuid] = (first_datablock, collection_name)
+            else:
+                if second_datablock.library is not None:
+                    # linked/local: breaks the assumption that local are listed before linked. Strange.
+                    # could do as local.linked if we were sure that is doe"s not have another weird cause
+                    logger.error(
+                        f"Unexpected link datablock {first_datablock} listed before local {second_datablock} ..."
+                    )
+                    logger.error(f"... {second_datablock} ignored")
+                else:
+                    # linked/linked: Conflicts between two linked. One of:
+                    # - a library contains uuids and is indirectly linked more than once
+                    # - a self link
+                    # Probably need to locally reset both uuids, keeping the link target uuid for direct link datablock
+                    logger.error(f"Linked datablock with duplicate uuids {first_datablock} {second_datablock}...")
+                    logger.error("... unsupported")
 
         proxy_uuids = set(proxies.keys())
         blender_uuids = set(blender_items.keys())
 
-        # TODO LIB
+        # Ignore linked datablocks to find renamed datablocks, as they cannot be renamed locally
         renamed_uuids = {
-            uuid for uuid in blender_uuids & proxy_uuids if proxies[uuid].data("name") != blender_items[uuid][0].name
+            uuid
+            for uuid in blender_uuids & proxy_uuids
+            if not isinstance(proxies[uuid], DatablockLinkProxy)
+            and proxies[uuid].data("name") != blender_items[uuid][0].name
         }
         added_uuids = blender_uuids - proxy_uuids - renamed_uuids
         removed_uuids = proxy_uuids - blender_uuids - renamed_uuids

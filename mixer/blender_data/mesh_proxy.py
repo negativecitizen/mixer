@@ -31,6 +31,7 @@ import bpy.types as T  # noqa
 from mixer.blender_data import specifics
 from mixer.blender_data.attributes import apply_attribute, diff_attribute
 from mixer.blender_data.datablock_proxy import DatablockProxy
+from mixer.blender_data.json_codec import serialize
 from mixer.blender_data.proxy import Delta, DeltaReplace, DeltaUpdate
 
 if TYPE_CHECKING:
@@ -133,6 +134,7 @@ class VertexGroups:
         return array_sequence
 
 
+@serialize
 class MeshProxy(DatablockProxy):
     """
     Proxy for a Mesh datablock. This specialization is required to handle geometry resize processing, that
@@ -158,13 +160,8 @@ class MeshProxy(DatablockProxy):
                     return True
         return False
 
-    def load(
-        self,
-        datablock: T.ID,
-        context: Context,
-        bpy_data_collection_name: str = None,
-    ) -> MeshProxy:
-        super().load(datablock, context, bpy_data_collection_name)
+    def load(self, datablock: T.ID, context: Context) -> MeshProxy:
+        super().load(datablock, context)
         self._arrays["vertex_groups"] = VertexGroups.from_mesh(datablock).to_array_sequence()
         return self
 
@@ -179,42 +176,34 @@ class MeshProxy(DatablockProxy):
             diff.load(struct, context)
 
             # force ObjectProxy._diff to resend the Vertex groups
-            logger.debug(f"_diff: {struct} requires clear_geometry: replace")
             context.visit_state.dirty_vertex_groups.add(struct.mixer_uuid)
             return DeltaReplace(diff)
         else:
-            if prop is not None:
-                context.visit_state.path.append(key)
-            try:
-                # vertex groups are always replaced as a whole
-                mesh_vertex_groups = VertexGroups.from_mesh(struct).to_array_sequence()
-                proxy_vertex_groups: ArrayGroup = self._arrays.get("vertex_groups", [])
-                if mesh_vertex_groups != proxy_vertex_groups:
-                    logger.debug(f"_diff: {struct} dirty vertex groups")
-                    diff._arrays["vertex_groups"] = mesh_vertex_groups
+            # vertex groups are always replaced as a whole
+            mesh_vertex_groups = VertexGroups.from_mesh(struct).to_array_sequence()
+            proxy_vertex_groups: ArrayGroup = self._arrays.get("vertex_groups", [])
+            if mesh_vertex_groups != proxy_vertex_groups:
+                diff._arrays["vertex_groups"] = mesh_vertex_groups
 
-                    # force Object update. This requires that Object updates are processed later, which seems to be
-                    # the order  they are listed in Depsgraph.updates
-                    context.visit_state.dirty_vertex_groups.add(struct.mixer_uuid)
+                # force Object update. This requires that Object updates are processed later, which seems to be
+                # the order  they are listed in Depsgraph.updates
+                context.visit_state.dirty_vertex_groups.add(struct.mixer_uuid)
 
-                properties = context.synchronized_properties.properties(struct)
-                properties = specifics.conditional_properties(struct, properties)
-                for k, member_property in properties:
-                    try:
-                        member = getattr(struct, k)
-                    except AttributeError:
-                        logger.warning(f"diff: unknown attribute {k} in {struct}")
-                        continue
+            properties = context.synchronized_properties.properties(struct)
+            properties = specifics.conditional_properties(struct, properties)
+            for k, member_property in properties:
+                try:
+                    member = getattr(struct, k)
+                except AttributeError:
+                    logger.warning("diff: unknown attribute ...")
+                    logger.warning(f"... {context.visit_state.display_path()}.{k}")
+                    continue
 
-                    proxy_data = self._data.get(k)
-                    delta = diff_attribute(member, k, member_property, proxy_data, context)
+                proxy_data = self._data.get(k)
+                delta = diff_attribute(member, k, member_property, proxy_data, context)
 
-                    if delta is not None:
-                        diff._data[k] = delta
-
-            finally:
-                if prop is not None:
-                    context.visit_state.path.pop()
+                if delta is not None:
+                    diff._data[k] = delta
 
             if len(diff._data) or len(diff._arrays):
                 return DeltaUpdate(diff)
@@ -258,20 +247,16 @@ class MeshProxy(DatablockProxy):
 
             # collection resizing will be done in AosProxy.apply()
 
-            context.visit_state.path.append(key)
-            try:
-                for k, member_delta in struct_update._data.items():
-                    current_value = self._data.get(k)
-                    try:
-                        self._data[k] = apply_attribute(attribute, k, current_value, member_delta, context, to_blender)
-                    except Exception as e:
-                        logger.warning(f"Struct.apply(). Processing {member_delta}")
-                        logger.warning(f"... for {attribute}.{k}")
-                        logger.warning(f"... Exception: {e!r}")
-                        logger.warning("... Update ignored")
-                        continue
-            finally:
-                context.visit_state.path.pop()
+            for k, member_delta in struct_update._data.items():
+                current_value = self._data.get(k)
+                try:
+                    self._data[k] = apply_attribute(attribute, k, current_value, member_delta, context, to_blender)
+                except Exception as e:
+                    logger.warning(f"Struct.apply(). Processing {member_delta}")
+                    logger.warning(f"... for {attribute}.{k}")
+                    logger.warning(f"... Exception: {e!r}")
+                    logger.warning("... Update ignored")
+                    continue
 
             # If a face is removed from a cube, the vertices array is unchanged but the polygon array is changed.
             # We expect to receive soa updates for arrays that have been modified, but not for unmodified arrays.

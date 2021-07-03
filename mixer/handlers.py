@@ -32,21 +32,29 @@ import logging
 
 import bpy
 
-from mixer.share_data import share_data
+from mixer.share_data import share_data, get_object_constraints
 from mixer import handlers_generic as generic
 from mixer.blender_client import collection as collection_api
 from mixer.blender_client import object_ as object_api
 from mixer.blender_client import scene as scene_api
+from mixer.blender_client import constraint as constraint_api
 import mixer.shot_manager as shot_manager
 import itertools
 from typing import Mapping, Any
 from uuid import uuid4
 
-from bpy.app.handlers import persistent
+if bpy.app.handlers.persistent is not None:
+    from bpy.app.handlers import persistent
+else:
+
+    def persistent(f):
+        return f
+
 
 from mixer.share_data import object_visibility
 from mixer.draw_handlers import remove_draw_handlers
 from mixer.blender_client.client import update_params
+from mixer.bl_utils import get_mixer_prefs
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +90,18 @@ class HandlerManager:
         return False
 
     @classmethod
+    def _set_connection_handler(cls, connect: bool):
+        try:
+            if connect:
+                if handler_on_load not in bpy.app.handlers.load_pre:
+                    bpy.app.handlers.load_pre.append(handler_on_load)
+            else:
+                if handler_on_load in bpy.app.handlers.load_pre:
+                    bpy.app.handlers.load_pre.remove(handler_on_load)
+        except Exception as e:
+            logger.error("Exception during _set_connection_handler(%s) : %s", connect, e)
+
+    @classmethod
     def _set_handlers(cls, connect: bool):
         try:
             if connect:
@@ -91,9 +111,7 @@ class HandlerManager:
                 bpy.app.handlers.redo_pre.append(handler_on_undo_redo_pre)
                 bpy.app.handlers.undo_post.append(handler_on_undo_redo_post)
                 bpy.app.handlers.redo_post.append(handler_on_undo_redo_post)
-                bpy.app.handlers.load_post.append(handler_on_load)
             else:
-                bpy.app.handlers.load_post.remove(handler_on_load)
                 # bpy.app.handlers.frame_change_post.remove(handler_send_frame_changed)
                 bpy.app.handlers.depsgraph_update_post.remove(handler_send_scene_data_to_server)
                 bpy.app.handlers.undo_pre.remove(handler_on_undo_redo_pre)
@@ -133,7 +151,8 @@ processing_depsgraph_handler = False
 def handler_send_scene_data_to_server(scene, dummy):
     global processing_depsgraph_handler
     if processing_depsgraph_handler:
-        logger.error("Depsgraph handler recursion attempt")
+        # this happens when an operator is called during the depsgraph handler processing, which is common with armatures
+        logger.debug("Depsgraph handler recursion attempt (safe with armatures)")
         return
 
     processing_depsgraph_handler = True
@@ -178,7 +197,8 @@ def update_frame_start_end():
 @persistent
 def handler_on_load(scene):
     logger.info("handler_on_load")
-    pass
+    if share_data.client is not None:
+        bpy.ops.mixer.disconnect()
 
 
 def get_scene(scene_name):
@@ -373,6 +393,41 @@ def update_object_state(old_objects: dict, new_objects: dict):
         if visibility != object_visibility(new_obj):
             share_data.objects_visibility_changed.add(obj_name)
 
+    for obj_name, constraints in share_data.objects_constraints.items():
+        new_obj = share_data.old_objects.get(obj_name)
+        if not new_obj:
+            continue
+        new_constraints = get_object_constraints(new_obj)
+        if new_constraints.has_parent_constraint and not constraints.has_parent_constraint:
+            share_data.objects_constraints_added.add(
+                (obj_name, constraint_api.ConstraintType.PARENT, new_constraints.parent_target.name_full)
+            )
+        elif (
+            constraints.has_parent_constraint
+            and new_constraints.has_parent_constraint
+            and constraints.parent_target != new_constraints.parent_target
+        ):
+            share_data.objects_constraints_added.add(
+                (obj_name, constraint_api.ConstraintType.PARENT, new_constraints.parent_target.name_full)
+            )
+        elif not new_constraints.has_parent_constraint and constraints.has_parent_constraint:
+            share_data.objects_constraints_removed.add((obj_name, constraint_api.ConstraintType.PARENT))
+
+        if new_constraints.has_look_at_constraint and not constraints.has_look_at_constraint:
+            share_data.objects_constraints_added.add(
+                (obj_name, constraint_api.ConstraintType.LOOK_AT, new_constraints.look_at_target.name_full)
+            )
+        elif (
+            constraints.has_look_at_constraint
+            and new_constraints.has_look_at_constraint
+            and constraints.look_at_target != new_constraints.look_at_target
+        ):
+            share_data.objects_constraints_added.add(
+                (obj_name, constraint_api.ConstraintType.LOOK_AT, new_constraints.look_at_target.name_full)
+            )
+        elif not new_constraints.has_look_at_constraint and constraints.has_look_at_constraint:
+            share_data.objects_constraints_removed.add((obj_name, constraint_api.ConstraintType.LOOK_AT))
+
     update_frame_changed_related_objects_state(old_objects, new_objects)
 
 
@@ -547,6 +602,38 @@ def update_objects_visibility():
     return changed
 
 
+def update_objects_constraints():
+    constraint_sent = False
+    for obj_name in share_data.objects_added:
+        if obj_name in share_data.blender_objects:
+            obj = share_data.blender_objects[obj_name]
+            for constr in obj.constraints:
+                constraint_type = None
+                if constr.type == "CHILD_OF":
+                    constraint_type = constraint_api.ConstraintType.PARENT
+                elif constr.type == "TRACK_TO":
+                    constraint_type = constraint_api.ConstraintType.LOOK_AT
+                if constraint_type is not None:
+                    constraint_api.send_add_constraint(share_data.client, obj, constraint_type, constr.target.name_full)
+                    constraint_sent = True
+
+    changed_added = False
+    for obj_name, constraint_type, target in share_data.objects_constraints_added:
+        if obj_name in share_data.blender_objects:
+            obj = share_data.blender_objects[obj_name]
+            constraint_api.send_add_constraint(share_data.client, obj, constraint_type, target)
+            changed_added = True
+
+    changed_removed = False
+    for obj_name, constraint_type in share_data.objects_constraints_removed:
+        if obj_name in share_data.blender_objects:
+            obj = share_data.blender_objects[obj_name]
+            constraint_api.send_remove_constraints(share_data.client, obj, constraint_type)
+            changed_removed = True
+
+    return constraint_sent or changed_added or changed_removed
+
+
 def update_objects_transforms():
     # changed = False
     for obj_name in share_data.objects_transformed:
@@ -638,37 +725,6 @@ def update_objects_data():
             update_params(c)
 
 
-def send_animated_data():
-    animated_camera_set = set()
-    animated_light_set = set()
-    camera_dict = {}
-    light_dict = {}
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    for update in depsgraph.updates:
-        obj = update.id.original
-        typename = obj.bl_rna.name
-        if typename == "Object":
-            if obj.data and obj.data.animation_data is not None:
-                if obj.data.bl_rna.name == "Camera":
-                    camera_dict[obj.data.animation_data.action.name_full] = obj
-                if (
-                    obj.data.bl_rna.name == "Point Light"
-                    or obj.data.bl_rna.name == "Sun Light"
-                    or obj.data.bl_rna.name == "Spot Light"
-                ):
-                    light_dict[obj.data.animation_data.action.name_full] = obj
-        if typename == "Action":
-            if camera_dict.get(obj.name_full):
-                animated_camera_set.add(camera_dict[obj.name_full])
-            if light_dict.get(obj.name_full):
-                animated_light_set.add(light_dict[obj.name_full])
-
-    for camera in animated_camera_set:
-        share_data.client.send_camera_attributes(camera)
-    for light in animated_light_set:
-        share_data.client.send_light_attributes(light)
-
-
 def send_frame_changed(scene):
     logger.debug("send_frame_changed")
 
@@ -698,12 +754,6 @@ def send_frame_changed(scene):
 
     # update for next change
     share_data.update_objects_info()
-
-    # temporary code :
-    # animated parameters are not sent, we need camera & light animated parameters for VRtist
-    # (focal lens etc.)
-    # please remove this when animation is managed
-    send_animated_data()
 
     scene_camera_name = ""
     if bpy.context.scene.camera is not None:
@@ -776,6 +826,7 @@ def send_scene_data_to_server(scene, dummy):
     changed |= delete_scene_objects()
     changed |= rename_objects()
     changed |= update_objects_visibility()
+    changed |= update_objects_constraints()
     changed |= update_objects_transforms()
     changed |= reparent_objects()
     changed |= shot_manager.check_montage_mode()
@@ -791,8 +842,10 @@ def send_scene_data_to_server(scene, dummy):
 
 @persistent
 def handler_on_undo_redo_pre(scene):
-    logger.info("on_undo_redo_pre")
-    send_scene_data_to_server(scene, None)
+    if share_data.use_vrtist_protocol():
+        send_scene_data_to_server(scene, None)
+    else:
+        share_data.bpy_data_proxy.snapshot_undo_pre()
 
 
 def remap_objects_info():
@@ -807,6 +860,10 @@ def remap_objects_info():
         visible = share_data.objects_visibility[old_name]
         del share_data.objects_visibility[old_name]
         share_data.objects_visibility[new_name] = visible
+
+        constraints = share_data.objects_constraints[old_name]
+        del share_data.objects_constraints[old_name]
+        share_data.objects_constraints[new_name] = constraints
 
         parent = share_data.objects_parents[old_name]
         del share_data.objects_parents[old_name]
@@ -824,60 +881,68 @@ def remap_objects_info():
 
 @persistent
 def handler_on_undo_redo_post(scene, dummy):
-    logger.info("on_undo_redo_post")
+    logger.error(f"Undo/redo post on {scene}")
+    share_data.client.send_error(f"Undo/redo post from {get_mixer_prefs().user}")
 
-    share_data.set_dirty()
-    share_data.clear_lists()
-    # apply only in object mode
-    if not is_in_object_mode():
-        return
+    if not share_data.use_vrtist_protocol():
+        # Generic sync: reload all datablocks
+        undone = share_data.bpy_data_proxy.snapshot_undo_post()
+        logger.warning(f"undone uuids : {undone}")
+        share_data.bpy_data_proxy.reload_datablocks()
+    else:
+        share_data.set_dirty()
+        share_data.clear_lists()
+        # apply only in object mode
+        if not is_in_object_mode():
+            return
 
-    old_objects_name = dict([(k, None) for k in share_data.old_objects.keys()])  # value not needed
-    remap_objects_info()
-    for k, v in share_data.old_objects.items():
-        if k in old_objects_name:
-            old_objects_name[k] = v
+        old_objects_name = dict([(k, None) for k in share_data.old_objects.keys()])  # value not needed
+        remap_objects_info()
+        for k, v in share_data.old_objects.items():
+            if k in old_objects_name:
+                old_objects_name[k] = v
 
-    update_object_state(old_objects_name, share_data.old_objects)
+        update_object_state(old_objects_name, share_data.old_objects)
 
-    update_collections_state()
-    update_scenes_state()
+        update_collections_state()
+        update_scenes_state()
 
-    remove_objects_from_scenes()
-    remove_objects_from_collections()
-    remove_collections_from_scenes()
-    remove_collections_from_collections()
+        remove_objects_from_scenes()
+        remove_objects_from_collections()
+        remove_collections_from_scenes()
+        remove_collections_from_collections()
 
-    remove_collections()
-    add_scenes()
-    add_objects()
-    add_collections()
+        remove_collections()
+        add_scenes()
+        add_objects()
+        add_collections()
 
-    add_collections_to_scenes()
-    add_collections_to_collections()
+        add_collections_to_scenes()
+        add_collections_to_collections()
 
-    add_objects_to_collections()
-    add_objects_to_scenes()
+        add_objects_to_collections()
+        add_objects_to_scenes()
 
-    update_collections_parameters()
-    create_vrtist_objects()
-    delete_scene_objects()
-    rename_objects()
-    update_objects_visibility()
-    update_objects_transforms()
-    reparent_objects()
+        update_collections_parameters()
+        create_vrtist_objects()
+        delete_scene_objects()
+        rename_objects()
+        update_objects_visibility()
+        update_objects_constraints()
+        update_objects_transforms()
+        reparent_objects()
 
-    # send selection content (including data)
-    materials = set()
-    for obj in bpy.context.selected_objects:
-        update_transform(obj)
-        if hasattr(obj, "data"):
-            update_params(obj)
-        if hasattr(obj, "material_slots"):
-            for slot in obj.material_slots[:]:
-                materials.add(slot.material)
+        # send selection content (including data)
+        materials = set()
+        for obj in bpy.context.selected_objects:
+            update_transform(obj)
+            if hasattr(obj, "data"):
+                update_params(obj)
+            if hasattr(obj, "material_slots"):
+                for slot in obj.material_slots[:]:
+                    materials.add(slot.material)
 
-    for material in materials:
-        share_data.client.send_material(material)
+        for material in materials:
+            share_data.client.send_material(material)
 
-    share_data.update_current_data()
+        share_data.update_current_data()

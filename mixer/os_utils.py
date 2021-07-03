@@ -22,6 +22,8 @@ Utility functions that may require os/platform specific adjustments
 import getpass
 import os
 import platform
+import subprocess
+from pathlib import Path
 import sys
 from typing import List
 
@@ -47,7 +49,11 @@ def tech_infos() -> List[str]:
     date = getattr(mixer, "version_date", None)
     date_string = f"({date})" if date is not None else ""
     lines.append(f"Mixer    : {mixer.display_version} {date_string}")
+    return lines
 
+
+def addon_infos() -> List[str]:
+    lines = []
     for bl_module in addon_utils.modules():
         name = bl_module.bl_info["name"]
         module = sys.modules.get(bl_module.__name__)
@@ -57,3 +63,15 @@ def tech_infos() -> List[str]:
             lines.append(f"Addon    : {name} {version}")
 
     return lines
+
+
+def open_folder(path):
+    """
+    Open a path or an URL with the application specified by the os
+    """
+    if sys.platform == "darwin":
+        subprocess.check_call(["open", "--", path])
+    elif sys.platform == "linux":
+        subprocess.check_call(["xdg-open", path])
+    elif sys.platform == "win32":
+        subprocess.Popen(f'explorer "{Path(path)}"')

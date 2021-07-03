@@ -1,8 +1,132 @@
-# 0.19.0 (wip)
+# 1.1.0 (WIP)
+
+## Documentation
+
+- Fix README.md (thanks @XenioxYT, @b4zz4)
+- Explicit warning about undo limitations.
+
+# 1.0.0 (2021-04-21)
+
+## Documentation
+
+- Online user [documentation](https://ubisoft-mixer.readthedocs.io/en/latest/)
+- Video [tutorials](https://www.youtube.com/channel/UCVfQBSBBvo8GMndYy2TzQHw)
+
+## Features
+
+- Armatures: synchronization
+- Geometry node tres: synchronization
+- Synchronization: ignore scene camera
+- UI: add a prefix to default room name based on user name
+- UI: add the list of users per room
+- UI: improved visibility of Connect and Disconnect buttons for existing rooms
+- UI: removed unused "Join" progress value
+- UI: improve warning feedback when Blender or Mixer versions are not the same as the room ones
 
 ## Fixes
 
-- Decimate modifier: fix synchronization of delimit attribute
+- Synchronization: ignore "select" attribute everywhere
+- UI: color for other users is now accurate
+- Node trees: fix missing connections
+- Readme fixes (thanks [bangseongbeom](https://github.com/bangseongbeom))
+
+# 0.22.0 (19-03-2021)
+
+## Features
+
+- UI: simplification of Mixer panel
+- UI: property panel for the selected room
+- UI: advanced and developer properties moved to add-on preferences
+- UI: toggle between Mixer and VRtist panels
+- Grease pencil: synchronize effects
+
+## Fixes
+
+- Object modifier: synchronization error on Blender 2.92
+- VSE: synchronization error on Blender 2.92
+- UI: invalid values for user color
+- Synchronization: ignore 3D cursor, viewport transform modes, snapping and render engine
+
+## CI
+
+- Tests: run unit tests against several Blender versions
+
+# 0.21.1 (22-02-2021)
+
+## Fixes
+
+- Addon load failure on Blender 2.92 RC
+
+# 0.21.0 (19-02-2021)
+
+## Features
+
+- Animation data: synchronization of key frames, curves and drivers
+- MovieClip: synchronization
+- Scene annotations: synchronization
+- TextCurve: synchronization (with builtin VectorFont only)
+- Texture: synchronization
+- UI: simplify the Mixer panel and make selection gizmos settings more accessible
+- UI: updates received when not in OBJECT mode are retained until OBJECT mode is entered
+- UI: can disable display of peer names on selection boxes in Mixer gizmos preferences
+
+## Fixes
+
+- Material nodes: fix possibly missing nodes and connections
+- Lights: after light morphing, new type-specific attributes were not synchronized
+- Libraries: synchronization error after using "duplicate linked" on an Object from a library
+- Undo: fix some synchronization failures and crashes
+- UI: selection box displayed with offset for instances of collections with instance_offset
+- UI: room creation failed after loading a new file without disconnecting
+
+## Breaking changes
+
+- require Blender 2.91.0
+
+# 0.20.0 (22-01-2021)
+
+## Features
+
+- Shared folders: contents of shared folders are not synchronized by Mixer, but must be synchronized by a user-provided
+  mechanism like a network share or a file synchronization tool.
+- Libraries: synchronization, including nested libraries. Overrides, make local, reload, duplicate linked, self linking are not supported.
+- Require identical Blender and Mixer versions among all users of a room.
+
+## Fixes
+
+- UI: display user name on a single item when a collection is selected
+- Room join: fix impossible join because of incompatible VRtist protocol setting
+([#15](https://gitlab.com/ubisoft-animation-studio/mixer/-/issues/15))
+- Mesh: fix crash when receiving a mesh in a mixed Linux/windows room
+([#17](https://gitlab.com/ubisoft-animation-studio/mixer/-/issues/17))
+- Material: fix synchronization failure after removing a shading node
+- Material: fix a crash after receiving a Material node_tree update
+- LayerCollection: fix synchronization failure
+- Logging: cleanup
+
+## Breaking changes
+
+- require Blender 2.83.9
+
+# 0.19.0 (18-12-2020)
+
+## Features
+
+- Shared folders
+- Mesh: synchronization of vertex groups and shape keys
+- Curves: synchronization of shape keys
+- View layers: synchronization
+- Custom properties: synchronization
+
+## Fixes
+
+- Object parenting: synchronization of child object location
+- Decimate modifier: synchronization of delimit attribute
+- Curves: exception when loading empty curve
+- Metaballs: error messages
+- Material assignment: synchronization with multiple materials
+- Logging: more focused messages in warning mode
+
 
 # 0.18.0 (2020-11-18)
 

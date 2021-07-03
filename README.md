@@ -1,72 +1,49 @@
 # Mixer
 
-**Disclaimer**: This project is in alpha state and actively developed. Do not use it to edit your production assets without a backup or you might break them. In the code you might see references to VRtist or Shot Manager, which are other technologies / addons that are developed in our studio. Don't pay too much attention to related code since we plan to extract it in some way, probably with a plugins strategy.
+Mixer is a Blender addon for real time collaboration in Blender. It allows multiple Blender users to work on the same scene at the same time and is developed by the R&D department of Ubisoft Animation Studio.
 
-Note that development is on Windows 10. Please report issues and submit PRs for other OSs.
+![Mixer screenshot](docs/img/home_mixer.png)
 
-Look for the details about the latest version in its announcement issue.
+**Disclaimer**: Although designed to be used in a production context it is still an experimental tool.
+In spite of all our efforts to make it reliable, it may in some circumstances corrupt your Blender scenes data.
+Be aware that neither Ubisoft nor Ubisoft employees can be taken as responsible in such cases. Use it at your own risks.
 
-## Introduction
+**This said, we will do our best to improve Mixer thanks to your feedback in order to provide a memorable creative collaborative experience.
+Have fun !**
 
-Mixer is a Blender addon developed at Ubisoft Animation Studio for Real Time Collaboration in 3D edition. It allows multiple Blender users to work on the same scene at the same time. Thanks to a broadcasting server that is independent from Blender, it is also possible to implement a connection for other 3D editing softwares.
+## Features
 
-## Usage
+Refer to the online documentation for details about current [features and limitations](https://ubisoft-mixer.readthedocs.io/en/latest/getting-started/features.html).
 
-As a Blender user, you can download the addon from the Gitlab release page https://gitlab.com/ubisoft-animation-studio/mixer/-/releases and install it into Blender. Pick the archive under Assets/Other part of the last release.
+## Documentation and Usage
 
-We didn't write extensive documentation for the user interface because it is still a work in progress and might change often. We'll write a tutorial with screenshots and make videos once the UI become stable.
+Documentation is available at the web site https://ubisoft-mixer.readthedocs.io/ to :
 
-From the Mixer panel in the 3D viewport you can enter an IP address, a port and connect to a server. If you enter `localhost` and no Mixer server is already running on your computer, then the addon will start one in the background when you click `Connect`.
+- [download and install](https://ubisoft-mixer.readthedocs.io/en/latest/getting-started/install.html),
+- [test](https://ubisoft-mixer.readthedocs.io/en/latest/getting-started/first-steps.html) locally,
+- then [get connected](https://ubisoft-mixer.readthedocs.io/en/latest/collaborate/get-connected.html) and [work together](https://ubisoft-mixer.readthedocs.io/en/latest/collaborate/work-together.html)
 
-Then you can test locally between two Blender instances, or you can open the port on your router and give your external IP address to other people so they can join your session.
+## Updates
 
-If all participants are in the same network everything should work directly. If participants are not on the same LAN, see [hosting a Mixer server](doc/hosting.md)
+Updates are announced in the [mixer-addon Blender Chat](https://blender.chat/channel/mixer-addon) channel.
 
-A Mixer server hosts rooms that are created by users. By default there is no room and someone connected to the server needs to create one from the panel. The creator of the room will upload its current blender data to the server, and this data will be transferred to people that connect to the room.
+## Support
 
-When all users leave a room, its content is destroyed, so someone needs to save the file before everyone leave, if you want to keep it. Optionally you can check the "keep open" checkbox so the room will remain open even if it has no users.
+The active support repository is on the [Mixer Github repository](https://github.com/ubisoft/mixer) which is part of the [Ubisoft open source](https://github.com/ubisoft) projects group.
 
-As a Developer, you may want to read the [Developer environment](doc/development.md) documentation that details our setup.
+## Community
 
-### Known limitations
+The online documentation lists the [YouTube videos](https://ubisoft-mixer.readthedocs.io/en/latest/community/on_youtube.html) posted by community members.
 
-- Avoid using Undo as it may cause problems like disappearing objects or crashes.
-- Synchronization is currently limited to cameras, collections, grease pencils, lights, materials, metaballs, meshes, objects and scenes (without view layers).
+## Feedback and contribution
 
-You will find more detailed information in the changelogs and in the announcement issue that comes with the new version.
+Post your feedback and discuss your ideas with us on the [Mixer Blender chat](https://blender.chat/channel/mixer-addon).
 
-
-## Repositories
-
-The main repository is on Gitlab https://gitlab.com/ubisoft-animation-studio/mixer, please post your issues and merge requests there.
-
-On the Gitlab repository you can see the CI tasks running (linting, unit tests, packing the addon and releases) and you have access to clean releases on the dedicated page https://gitlab.com/ubisoft-animation-studio/mixer/-/releases.
-
-We do our development on both public Gitlab and an internal instance at Ubisoft. Mirroring is used to keep all repositories in sync (commits, tags and branches). We are slowly moving some important issues to the public repository to give more information to the community about our future developments and to open discussions.
-
-We also have a mirror on Github https://github.com/ubisoft/mixer, as part of Ubisoft open source repositories.
-
-## Contributing
-
-You can [report any bug through issues on Gitlab](https://gitlab.com/ubisoft-animation-studio/mixer/-/issues). Please include the version you use in the issue and how to reproduce the bug, if possible. You can join a blender file, or a room file that you can save with the "Download Room" button in advanced room options.
-
-You can [submit a merge requests on Gitlab](https://gitlab.com/ubisoft-animation-studio/mixer/-/merge_requests), but keep in mind that the architecture of the addon is likely to change significantly in the next few months. For bugfixes, simple refactoring, typos, documentation, or things related to the usage of the Blender API you can directly submit the merge request. For features please also open an issue to discuss it, so we can think about how it would fit in the future architecture.
-
-If you have quick questions or want to chat with us, we have a channel on the Blender chat dedicated to this addon: https://blender.chat/channel/mixer-addon
+You can also get involved into the development of Mixer, discover how by reading these [contribution guidelines](doc/README.md).
 
 ## License and copyright
 
 The original code is Copyright (C) 2020 Ubisoft.
 
-All code of the `mixer` package except the `mixer.broadcaster` sub-package is under the GPLv3 license. Code of the `mixer.broadcaster` sub-package is under the MIT license so feel free to extract it and use it directly in other python projects that are under a permissive license.
+All code of the `mixer` package is under the GPLv3 license except code of the `mixer.broadcaster` sub-package, which is under the MIT license.
 
-## Documentation
-
-More documentation is available in the `doc` directory:
-
-- [Client-Server protocol](doc/protocol.md)
-- [Data synchronization](doc/synchronization.md)
-- [Developer environment](doc/development.md)
-- [Releasing a new version](doc/release.md)
-- [Unit testing](doc/unittest.md)
-- [Hosting a Mixer server](doc/hosting.md)

@@ -24,7 +24,6 @@ from typing import Any, Optional, Union, TYPE_CHECKING
 import bpy
 import bpy.types as T  # noqa
 
-from mixer.blender_data.blenddata import bl_rna_to_type
 from mixer.blender_data.proxy import Delta, DeltaUpdate, Proxy
 from mixer.blender_data.specifics import is_soable_collection
 from mixer.blender_data.type_helpers import is_vector, is_matrix
@@ -35,23 +34,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def is_ID_subclass_rna(bl_rna):  # noqa
-    """
-    Return true if the RNA is of a subclass of bpy.types.ID
-    """
-    return issubclass(bl_rna_to_type(bl_rna), bpy.types.ID)
-
-
 MAX_DEPTH = 30
 
 _builtin_types = (float, int, bool, str, bytes)
 
 
-def read_attribute(attr: Any, key: Union[int, str], attr_property: T.Property, context: Context):
-    """
-    Load a property into a python object of the appropriate type, be it a Proxy or a native python object
-    """
+class _NotBuiltin(Exception):
+    pass
 
+
+def _read_builtin(attr):
     if isinstance(attr, _builtin_types):
         return attr
 
@@ -60,77 +52,112 @@ def read_attribute(attr: Any, key: Union[int, str], attr_property: T.Property, c
         return list(attr)
     if is_matrix(attr_type):
         return [list(col) for col in attr.col]
+
+    # TODO flatten
+    if attr_type == T.bpy_prop_array:
+        return list(attr)
+
+    raise _NotBuiltin
+
+
+def read_attribute(attr: Any, key: Union[int, str], attr_property: T.Property, parent: T.bpy_struct, context: Context):
+    """
+    Load a property into a python object of the appropriate type, be it a Proxy or a native python object
+    """
+
+    try:
+        return _read_builtin(attr)
+    except _NotBuiltin:
+        pass
+
     if isinstance(attr, set):
         from mixer.blender_data.misc_proxies import SetProxy
 
         return SetProxy().load(attr)
 
-    # We have tested the types that are usefully reported by the python binding, now harder work.
-    # These were implemented first and may be better implemented with the bl_rna property of the parent struct
-    # TODO flatten
-    if attr_type == T.bpy_prop_array:
-        return list(attr)
-
-    context.visit_state.recursion_guard.push(attr_property.identifier)
+    context.visit_state.push(attr_property, key)
     try:
+        from mixer.blender_data.misc_proxies import PtrToCollectionItemProxy
+
+        attr_type = type(attr)
         if attr_type == T.bpy_prop_collection:
             if hasattr(attr, "bl_rna") and isinstance(
                 attr.bl_rna, (type(T.CollectionObjects.bl_rna), type(T.CollectionChildren.bl_rna))
             ):
                 from mixer.blender_data.datablock_collection_proxy import DatablockRefCollectionProxy
 
-                return DatablockRefCollectionProxy().load(attr, key, context)
+                return DatablockRefCollectionProxy().load(attr, context)
             elif is_soable_collection(attr_property):
                 from mixer.blender_data.aos_proxy import AosProxy
 
-                return AosProxy().load(attr, key, attr_property, context)
+                return AosProxy().load(attr, attr_property, context)
             else:
+                # This code path is taken for collections that have an rna and collections that do not
+                # There should probably be different proxies for collection with and without rna.
+                # See comment in add_element()
                 from mixer.blender_data.struct_collection_proxy import StructCollectionProxy
 
-                return StructCollectionProxy.make(attr_property).load(attr, key, attr_property, context)
+                return StructCollectionProxy.make(attr_property).load(attr, context)
 
         # TODO merge with previous case
         if isinstance(attr_property, T.CollectionProperty):
             from mixer.blender_data.struct_collection_proxy import StructCollectionProxy
 
-            return StructCollectionProxy().load(attr, key, attr_property, context)
+            return StructCollectionProxy().load(attr, context)
 
         bl_rna = attr_property.bl_rna
         if bl_rna is None:
-            logger.warning("Not implemented: attribute %s", attr)
+            logger.error("read_attribute: no implementation for ...")
+            logger.error(f"... {context.visit_state.display_path()}.{key} (type: {type(attr)})")
             return None
 
         if issubclass(attr_type, T.PropertyGroup):
             from mixer.blender_data.struct_proxy import StructProxy
 
-            return StructProxy().load(attr, key, context)
+            return StructProxy.make(attr).load(attr, context)
 
         if issubclass(attr_type, T.ID):
             if attr.is_embedded_data:
-                # TODO probably better to use a StructProxy : all DatablockProxy would be standalone
-                from mixer.blender_data.datablock_proxy import DatablockProxy
+                # Embedded datablocks are loaded as StructProxy and DatablockProxy is reserved
+                # for standalone datablocks
+                from mixer.blender_data.struct_proxy import StructProxy
 
-                return DatablockProxy.make(attr_property).load(attr, context)
+                return StructProxy.make(attr).load(attr, context)
             else:
+                # Standalone databocks are loaded from DatablockCollectionProxy, so we can only encounter
+                # datablock references here
                 from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
 
-                return DatablockRefProxy().load(attr, key, context)
+                return DatablockRefProxy().load(attr, context)
+
+        proxy = PtrToCollectionItemProxy.make(type(parent), key)
+        if proxy is not None:
+            return proxy.load(attr)
 
         if issubclass(attr_type, T.bpy_struct):
             from mixer.blender_data.struct_proxy import StructProxy
 
-            return StructProxy().load(attr, key, context)
+            return StructProxy.make(attr).load(attr, context)
 
         if attr is None:
             from mixer.blender_data.misc_proxies import NonePtrProxy
 
             return NonePtrProxy()
 
-        logger.error(
-            f"Unsupported attribute {attr_type} {attr_property} at {context.visit_state.datablock_proxy._class_name}.{context.visit_state.path}.{attr_property.identifier}"
-        )
+        logger.error("read_attribute: no implementation for ...")
+        logger.error(f"... {context.visit_state.display_path()}.{key} (type: {type(attr)})")
     finally:
-        context.visit_state.recursion_guard.pop()
+        context.visit_state.pop()
+
+
+def get_attribute_value(parent, key):
+    if isinstance(key, int):
+        target = parent[key]
+    elif isinstance(parent, T.bpy_prop_collection):
+        target = parent.get(key)
+    else:
+        target = getattr(parent, key, None)
+    return target
 
 
 def write_attribute(
@@ -151,14 +178,17 @@ def write_attribute(
     # Like in apply_attribute parent and key are needed to specify a L-value in setattr()
     try:
         if isinstance(value, Proxy):
-            if isinstance(key, int):
-                target = parent[key]
-            elif isinstance(parent, T.bpy_prop_collection):
-                target = parent.get(key)
-            else:
-                target = getattr(parent, key, None)
+            attribute_value = get_attribute_value(parent, key)
+            context.visit_state.push(parent, key)
+            try:
+                value.save(attribute_value, parent, key, context)
+            except Exception as e:
+                logger.error("write_attribute: exception for ...")
+                logger.error(f"... attribute: {context.visit_state.display_path()}.{key}, value: {value}")
+                logger.error(f" ...{e!r}")
+            finally:
+                context.visit_state.pop()
 
-            value.save(target, parent, key, context)
         else:
             assert isinstance(key, str)
 
@@ -172,28 +202,30 @@ def write_attribute(
                 try:
                     setattr(parent, key, value)
                 except TypeError as e:
-                    # common for enum that have unsupported default values, such as FFmpegSettings.ffmpeg_preset,
-                    # which seems initialized at "" and triggers :
-                    #   TypeError('bpy_struct: item.attr = val: enum "" not found in (\'BEST\', \'GOOD\', \'REALTIME\')')
-                    logger.info(f"write attribute skipped {parent}.{key}...")
-                    logger.info(f" ...Exception: {repr(e)}")
+                    if value != "":
+                        # common for enum that have unsupported default values, such as FFmpegSettings.ffmpeg_preset,
+                        # which seems initialized at "" and triggers :
+                        #   TypeError('bpy_struct: item.attr = val: enum "" not found in (\'BEST\', \'GOOD\', \'REALTIME\')')
+                        logger.warning("write_attribute: exception for ...")
+                        logger.warning(f"... attribute: {context.visit_state.display_path()}.{key}, value: {value}")
+                        logger.warning(f" ...{e!r}")
 
-    except TypeError:
-        # common for enum that have unsupported default values, such as FFmpegSettings.ffmpeg_preset,
-        # which seems initialized at "" and triggers :
-        #   TypeError('bpy_struct: item.attr = val: enum "" not found in (\'BEST\', \'GOOD\', \'REALTIME\')')
-        logger.warning(f"write attribute skipped {parent}.{key}...")
-        for line in traceback.format_exc().splitlines():
-            logger.warning(f" ... {line}")
-    except AttributeError as e:
-        if isinstance(parent, bpy.types.Collection) and parent.name == "Master Collection" and key == "name":
+    except (IndexError, AttributeError) as e:
+        if (
+            isinstance(e, AttributeError)
+            and isinstance(parent, bpy.types.Collection)
+            and parent.name == "Master Collection"
+            and key == "name"
+        ):
             pass
         else:
-            logger.warning(f"write attribute skipped {parent}.{key}...")
-            logger.warning(f" ...Exception: {repr(e)}")
+            logger.warning("write_attribute: exception while accessing ...")
+            logger.warning(f"... attribute: {context.visit_state.display_path()}.{key}")
+            logger.warning(f" ...{e!r}")
 
     except Exception:
-        logger.warning(f"write attribute skipped {parent}.{key}...")
+        logger.warning("write_attribute: exception for ...")
+        logger.warning(f"... attribute: {context.visit_state.display_path()}.{key}, value: {value}")
         for line in traceback.format_exc().splitlines():
             logger.warning(f" ... {line}")
 
@@ -229,13 +261,13 @@ def apply_attribute(
 
     try:
         if isinstance(current_proxy_value, Proxy):
-            if isinstance(key, int):
-                target = parent[key]
-            elif isinstance(parent, T.bpy_prop_collection):
-                target = parent.get(key)
-            else:
-                target = getattr(parent, key, None)
-            return current_proxy_value.apply(target, parent, key, delta, context, to_blender)
+            attribute_value = get_attribute_value(parent, key)
+
+            context.visit_state.push(parent, key)
+            try:
+                return current_proxy_value.apply(attribute_value, parent, key, delta, context, to_blender)
+            finally:
+                context.visit_state.pop()
         else:
             if to_blender:
                 # try is less costly than fetching the property to find if the attribute is readonly
@@ -246,16 +278,18 @@ def apply_attribute(
                         setattr(parent, key, delta_value)
                     except AttributeError as e:
                         # most likely an addon (runtime) attribute that exists on the sender but no on this
-                        # receiver or a readonbly attribute that should be filtered out
+                        # receiver or a readonly attribute that should be filtered out
                         # Do not be too verbose
-                        logger.info(f"apply_attribute: exception for {parent} {key}")
-                        logger.info(f"... exception {e!r})")
+                        logger.info("apply_attribute: exception for ...")
+                        logger.info(f"... attribute: {context.visit_state.display_path()}.{key}, value: {delta_value}")
+                        logger.info(f" ...{e!r}")
 
             return delta_value
 
     except Exception as e:
-        logger.warning(f"apply_attribute: exception for {parent} {key}")
-        logger.warning(f"... exception {e!r})")
+        logger.warning("apply_attribute: exception for ...")
+        logger.warning(f"... attribute: {context.visit_state.display_path()}.{key}, value: {delta_value}")
+        logger.warning(f" ...{e!r}")
 
 
 def diff_attribute(
@@ -272,17 +306,21 @@ def diff_attribute(
     """
     try:
         if isinstance(value, Proxy):
-            return value.diff(item, key, item_property, context)
+            context.visit_state.push(item, key)
+            try:
+                return value.diff(item, key, item_property, context)
+            finally:
+                context.visit_state.pop()
 
         # An attribute mappable on a python builtin type
-        # TODO overkill to call read_attribute because it is not a proxy type
-        blender_value = read_attribute(item, key, item_property, context)
+        blender_value = _read_builtin(item)
         if blender_value != value:
-            # TODO This is too coarse (whole lists)
             return DeltaUpdate(blender_value)
 
     except Exception as e:
-        logger.warning(f"diff exception for attr {item} : {e!r}")
+        logger.warning("diff_attribute: exception for ...")
+        logger.warning(f"... attribute: {context.visit_state.display_path()}.{key}")
+        logger.warning(f" ...{e!r}")
         return None
 
     return None

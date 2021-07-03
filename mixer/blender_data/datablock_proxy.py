@@ -24,23 +24,25 @@ from __future__ import annotations
 from collections import defaultdict
 import logging
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+import pathlib
 
 import bpy
 import bpy.types as T  # noqa
 
 from mixer.blender_data import specifics
-from mixer.blender_data.blenddata import rna_identifier_to_collection_name
+from mixer.blender_data.bpy_data import rna_identifier_to_collection_name
 
 from mixer.blender_data.attributes import read_attribute, write_attribute
-from mixer.blender_data.proxy import Delta, DeltaReplace, DeltaUpdate
+from mixer.blender_data.json_codec import serialize
+from mixer.blender_data.proxy import Delta, DeltaReplace, DeltaUpdate, ExternalFileFailed, Uuid
 from mixer.blender_data.misc_proxies import CustomPropertiesProxy
 from mixer.blender_data.struct_proxy import StructProxy
 from mixer.blender_data.type_helpers import sub_id_type
-from mixer.local_data import get_source_file_path
+from mixer.local_data import get_resolved_file_path, get_source_file_path
 
 if TYPE_CHECKING:
     from mixer.blender_data.aos_soa_proxy import SoaElement
-    from mixer.blender_data.bpy_data_proxy import RenameChangeset, Context, VisitState
+    from mixer.blender_data.bpy_data_proxy import RenameChangeset, Context
     from mixer.blender_data.types import ArrayGroups, Path, SoaMember
 
 
@@ -49,37 +51,59 @@ DEBUG = True
 logger = logging.getLogger(__name__)
 
 
+@serialize
 class DatablockProxy(StructProxy):
     """
-    Proxy to a datablock, standalone (bpy.data.cameras['Camera']) or embedded.
+    Proxy to a standalone datablock (e.g. bpy.data.cameras['Camera']).
     """
 
-    _serialize = ("_bpy_data_collection", "_class_name", "_datablock_uuid", "_custom_properties")
+    _serialize: Tuple[str, ...] = (
+        "_bpy_data_collection",
+        "_data",
+        "_datablock_uuid",
+        "_custom_properties",
+        "_is_in_shared_folder",
+        "_filepath_raw",
+        "_type_name",
+    )
 
     def __init__(self):
+        # deserialization call the ctor with no arguments
+
         super().__init__()
 
         self._bpy_data_collection: str = ""
         """name of the bpy.data collection this datablock belongs to, None if embedded in another datablock"""
 
-        self._class_name: str = ""
-        self._datablock_uuid: str = ""
+        self._datablock_uuid: Uuid = ""
 
-        self._soas: Dict[VisitState.Path, List[Tuple[str, SoaElement]]] = defaultdict(list)
+        self._custom_properties = CustomPropertiesProxy()
+
+        self._soas: Dict[Path, List[Tuple[str, SoaElement]]] = defaultdict(list)
         """e.g. {
             ("vertices"): [("co", co_soa), ("normals", normals_soa)]
             ("edges"): ...
-        }"""
+        }
+        Serialized as array"""
 
         # TODO move into _arrays
         self._media: Optional[Tuple[str, bytes]] = None
+        """Media file data.
+        Serialized as array"""
+        self._is_in_shared_folder: Optional[bool] = None
+        self._filepath_raw: Optional[str] = None
 
         self._arrays: ArrayGroups = {}
-        """arrays that must not be serialized as json because of their size"""
+        """arrays that must not be serialized as json because of their size.
+        Serialized as array"""
 
-        self._initialized = False
+        self._has_datablock = False
+        """False for local (non link) datablocks received if they cannot be created (file error for images), for a
+        library before the first link datalock is loaded, for an indirect link datablock before the direct link
+        datablock is loaded. Always True on the sender side."""
 
-        self._custom_properties = CustomPropertiesProxy()
+        self._type_name: str = ""
+        """The type name in the bpy.type module, e.g. Object, TextCurve"""
 
     def copy_data(self, other: DatablockProxy):
         super().copy_data(other)
@@ -94,15 +118,6 @@ class DatablockProxy(StructProxy):
         if self._media:
             self._media.clear()
 
-    def init(self, datablock: T.ID):
-        if datablock is not None:
-            if not datablock.is_embedded_data:
-                type_name = sub_id_type(type(datablock)).bl_rna.identifier
-                self._bpy_data_collection = rna_identifier_to_collection_name[type_name]
-                self._datablock_uuid = datablock.mixer_uuid
-            self._class_name = datablock.__class__.__name__
-            self._initialized = True
-
     @property
     def arrays(self):
         return self._arrays
@@ -111,31 +126,46 @@ class DatablockProxy(StructProxy):
     def arrays(self, arrays: ArrayGroups):
         self._arrays = arrays
 
-    @classmethod
-    def make(cls, datablock: T.ID):
+    @property
+    def has_datablock(self):
+        return self._has_datablock
 
-        if isinstance(datablock, T.Object):
+    @classmethod
+    def make(cls, datablock: T.ID) -> DatablockProxy:
+        proxy: DatablockProxy
+        if datablock.library:
+            from mixer.blender_data.library_proxies import DatablockLinkProxy
+
+            proxy = DatablockLinkProxy()
+
+        elif isinstance(datablock, T.Armature):
+            from mixer.blender_data.armature_proxy import ArmatureProxy
+
+            proxy = ArmatureProxy()
+        elif isinstance(datablock, T.Library):
+            from mixer.blender_data.library_proxies import LibraryProxy
+
+            proxy = LibraryProxy()
+        elif isinstance(datablock, T.Object):
             from mixer.blender_data.object_proxy import ObjectProxy
 
-            return ObjectProxy()
-        if isinstance(datablock, T.Mesh):
+            proxy = ObjectProxy()
+        elif isinstance(datablock, T.Mesh):
             from mixer.blender_data.mesh_proxy import MeshProxy
 
-            return MeshProxy()
+            proxy = MeshProxy()
 
-        if isinstance(datablock, T.Key):
+        elif isinstance(datablock, T.Key):
             from mixer.blender_data.shape_key_proxy import ShapeKeyProxy
 
-            return ShapeKeyProxy()
-        return DatablockProxy()
+            proxy = ShapeKeyProxy()
+        else:
+            proxy = DatablockProxy()
 
-    @property
-    def is_standalone_datablock(self):
-        return bool(self._bpy_data_collection)
-
-    @property
-    def is_embedded_data(self):
-        return not self.is_standalone_datablock
+        type_name = sub_id_type(type(datablock)).bl_rna.identifier
+        proxy._bpy_data_collection = rna_identifier_to_collection_name()[type_name]
+        proxy._datablock_uuid = datablock.mixer_uuid
+        return proxy
 
     @property
     def mixer_uuid(self) -> str:
@@ -145,87 +175,151 @@ class DatablockProxy(StructProxy):
         self._data["name"] = new_name
 
     def __str__(self) -> str:
-        return f"DatablockProxy {self.mixer_uuid} for bpy.data.{self.collection_name}[{self.data('name')}]"
+        return f"{self.__class__.__name__} {self.mixer_uuid} for bpy.data.{self.collection_name}[{self.data('name')}]"
 
     def load(
         self,
         datablock: T.ID,
         context: Context,
-        bpy_data_collection_name: str = None,
     ) -> DatablockProxy:
-        """Load a datablock into this proxy
+        """Load a datablock into this proxy.
 
         Args:
-            datablock: the datablock to load into this proxy, may be standalone or embedded
+            datablock: the embedded datablock to load into this proxy
             context: visit and proxy state
-            bpy_data_collection_name: if datablock is standalone, name of the bpy.data collection that owns datablock,
-            otherwise None
 
         Returns:
             this DatablockProxy
         """
 
-        if not self._initialized:
-            if bpy_data_collection_name is None:
-                # TODO would be better to load embedded datablocks into StructProxy and use DatablockProxy
-                # only for standalone datablocks
-                assert datablock.is_embedded_data, f"load: {datablock} is not embedded and collection_name is None"
-                self._bpy_data_collection = ""
-            else:
-                assert (
-                    not datablock.is_embedded_data
-                ), f"load: {datablock} is embedded and collection_name is {bpy_data_collection_name}"
-                self._bpy_data_collection = bpy_data_collection_name
-            self._initialized = True
-
-        self._class_name = datablock.__class__.__name__
         self.clear_data()
+        self._type_name = type(datablock).__name__
+
+        self._has_datablock = True
+        if isinstance(datablock, T.Object):
+            context.proxy_state.register_object(datablock)
+
         properties = context.synchronized_properties.properties(datablock)
         # this assumes that specifics.py apply only to ID, not Struct
         properties = specifics.conditional_properties(datablock, properties)
         with context.visit_state.enter_datablock(self, datablock):
             for name, bl_rna_property in properties:
                 attr = getattr(datablock, name)
-                attr_value = read_attribute(attr, name, bl_rna_property, context)
+                attr_value = read_attribute(attr, name, bl_rna_property, datablock, context)
                 # Also write None values to reset attributes like Camera.dof.focus_object
                 # TODO for scene, test difference, only send update if dirty as continuous updates to scene
                 # master collection will conflicting writes with Master Collection
                 self._data[name] = attr_value
 
-        uuid = datablock.get("mixer_uuid")
-        if uuid:
-            # It is a bpy.data ID, not an ID "embedded" inside another ID, like scene.collection
-            id_ = context.proxy_state.datablocks.get(uuid)
-            if id_ is not datablock:
-                # this occurs when
-                # - when we find a reference to a BlendData ID that was not loaded
-                # - the ID are not properly ordred at creation time, for instance (objects, meshes)
-                # instead of (meshes, objects) : a bug
-                logger.debug("DatablockProxy.load(): %s not in context.proxy_state.datablocks[uuid]", datablock)
-            self._datablock_uuid = datablock.mixer_uuid
-            context.proxy_state.proxies[uuid] = self
-
-        self.attach_media_descriptor(datablock)
+        self.attach_filepath_raw(datablock)
+        self.attach_media_descriptor(datablock, context)
         self._custom_properties.load(datablock)
         return self
 
-    def attach_media_descriptor(self, datablock: T.ID):
+    def attach_filepath_raw(self, datablock: T.ID):
+        if hasattr(datablock, "filepath"):
+            filepath = datablock.filepath
+            if len(filepath) == 0:
+                return
+            if filepath[0] == "<" and filepath[-1] == ">":
+                # various builtin names, like "<builtin>" for VectorFont, or "<startup.blend>" for Library
+                return
+
+            try:
+                path_string = get_source_file_path(bpy.path.abspath(filepath))
+            except OSError as e:
+                logger.warning(f"{datablock!r}: invalid file path {filepath} ...")
+                logger.warning(f"... {e!r}")
+                return
+
+            path = pathlib.Path(path_string)
+            if not path.exists():
+                logger.warning(f"{datablock!r}: file with computed source path does not exist ...")
+                logger.warning(f"... filepath: '{filepath}'")
+                logger.warning(f"... abspath:  '{bpy.path.abspath(filepath)}'")
+                logger.warning(f"... source:   '{path_string}'")
+            self._filepath_raw = str(path)
+
+    def matches_shared_folder(self, filepath_str: str, context: Context):
+        filepath = pathlib.Path(filepath_str)
+        for shared_folder in context.proxy_state.shared_folders:
+            try:
+                relative_path = filepath.relative_to(shared_folder)
+            except ValueError:
+                continue
+            return str(relative_path)
+        return None
+
+    def resolve_shared_folder_file(self, relative_path: str, context: Context):
+        resolved_path = None
+        for shared_folder in context.proxy_state.shared_folders:
+            shared_folder_file = shared_folder / relative_path
+            if shared_folder_file.is_file():
+                if resolved_path is None:
+                    resolved_path = str(shared_folder_file)
+                else:
+                    logger.error("Unable to resolve shared_folder file: multiple matches found")
+                    resolved_path = None
+                    break
+        return resolved_path
+
+    def resolved_filepath(self, context: Context) -> Optional[str]:
+        """Returns the local filepath for the datablock.
+
+        This references a file in "shared files" or a temporary file"""
+        if self._filepath_raw is None:
+            return None
+
+        if not self._is_in_shared_folder:
+            resolved_filepath = get_resolved_file_path(self._filepath_raw)
+            logger.info(f"resolved_filepath: for {self} not in shared folder ...")
+            logger.info(f"... resolve {self._filepath_raw!r} to {resolved_filepath}")
+        else:
+            resolved_filepath = self.resolve_shared_folder_file(self._filepath_raw, context)
+            if resolved_filepath is None:
+                logger.info(f'"{self._filepath_raw}" not in shared_folder')
+            logger.info(f"resolved_filepath: for {self} in shared folder ...")
+            logger.info(f"... resolve {self._filepath_raw!r} to {resolved_filepath}")
+        return resolved_filepath
+
+    def attach_media_descriptor(self, datablock: T.ID, context: Context):
         # if Image, Sound, Library, MovieClip, Text, VectorFont, Volume
         # create a self._media with the data to be sent
         # - filepath
         # - reference to the packed data if packed
         #
         #
-        if isinstance(datablock, T.Image):
-            path = get_source_file_path(datablock.filepath)
+        if hasattr(datablock, "packed_file"):
+            self._is_in_shared_folder = False
+            if self._filepath_raw is None:
+                return
+
             packed_file = datablock.packed_file
             data = None
             if packed_file is not None:
                 data = packed_file.data
-            else:
-                with open(bpy.path.abspath(path), "rb") as data_file:
+                self._media = (get_source_file_path(self._filepath_raw), data)
+                return
+
+            relative_to_shared_folder_path = self.matches_shared_folder(self._filepath_raw, context)
+            if relative_to_shared_folder_path is not None:
+                self._filepath_raw = relative_to_shared_folder_path
+                self._is_in_shared_folder = True
+                self._media = None
+                return
+
+            path = get_source_file_path(self._filepath_raw)
+            try:
+                abspath = bpy.path.abspath(path)
+                with open(abspath, "rb") as data_file:
                     data = data_file.read()
-            self._media = (path, data)
+            except Exception as e:
+                logger.error(f"Error while loading {abspath!r} ...")
+                logger.error(f"... for {datablock!r}. Check shared folders ...")
+                logger.error(f"... {e!r}")
+                self._media = None
+            else:
+                self._media = (path, data)
 
     @property
     def collection_name(self) -> str:
@@ -241,7 +335,7 @@ class DatablockProxy(StructProxy):
 
     def target(self, context: Context) -> T.ID:
         """Returns the datablock proxified by this proxy"""
-        return context.proxy_state.datablocks.get(self.mixer_uuid)
+        return context.proxy_state.datablock(self.mixer_uuid)
 
     def create_standalone_datablock(self, context: Context) -> Tuple[Optional[T.ID], Optional[RenameChangeset]]:
         """
@@ -254,9 +348,13 @@ class DatablockProxy(StructProxy):
         renames: RenameChangeset = []
         incoming_name = self.data("name")
 
-        # Detect a conflicting creation
+        # Detect a conflicting creation by look for a datablock with the wanted name.
+        # Ignore the duplicate name if it is from a library, it is not a name clash
         existing_datablock = self.collection.get(incoming_name)
-        if existing_datablock:
+        if existing_datablock and not existing_datablock.library:
+            # The correct assertion is
+            #   assert existing_datablock.mixer_uuid
+            # but it causes a visible failure in a test that formerly failed silently (internal issue #396)
             if not existing_datablock.mixer_uuid:
                 # A datablock created by VRtist command in the same command batch
                 # Not an error, we will make it ours by adding the uuid and registering it
@@ -294,9 +392,11 @@ class DatablockProxy(StructProxy):
                     logger.error("... update ignored")
                     return None, None
         else:
-            datablock = specifics.bpy_data_ctor(self.collection_name, self, context)
+            try:
+                datablock = specifics.bpy_data_ctor(self.collection_name, self, context)
+            except ExternalFileFailed:
+                return None, None
 
-        self._initialized = True
         if datablock is None:
             if self.collection_name != "shape_keys":
                 logger.warning(f"Cannot create bpy.data.{self.collection_name}[{self.data('name')}]")
@@ -309,8 +409,15 @@ class DatablockProxy(StructProxy):
             if self.collection.get(name).name != datablock.name:
                 logger.error(f"Name mismatch after creation of bpy.data.{self.collection_name}[{name}] ")
 
-        datablock.mixer_uuid = self.mixer_uuid
-        return self._save(datablock, context), renames
+        self._has_datablock = True
+        uuid = self.mixer_uuid
+        datablock.mixer_uuid = uuid
+        context.proxy_state.add_datablock(uuid, datablock)
+        if isinstance(datablock, T.Object):
+            context.proxy_state.register_object(datablock)
+
+        datablock = self._save(datablock, context)
+        return datablock, renames
 
     def _save(self, datablock: T.ID, context: Context) -> T.ID:
         datablock = self._pre_save(datablock, context)
@@ -352,9 +459,6 @@ class DatablockProxy(StructProxy):
         Returns:
             The saved datablock
         """
-
-        # TODO it might be better to load embedded datablocks as StructProxy and remove this method
-        # assert self.is_embedded_data, f"save: called {parent}[{key}], which is not standalone"
 
         datablock = self._pre_save(attribute, context)
         if datablock is None:
@@ -415,21 +519,29 @@ class DatablockProxy(StructProxy):
         collection = getattr(bpy.data, self.collection_name)
         self.apply(attribute, collection, attribute.name, delta, context, to_blender=False)
 
-    def update_soa(self, bl_item, path: Path, soa_members: List[SoaMember]):
+    def update_soa(self, bl_item, path: Path, soa_members: List[SoaMember]) -> bool:
 
         r = self.find_by_path(bl_item, path)
         if r is None:
-            return
+            logger.error(f"update_soa: {path} not found in {bl_item}")
+            return False
         container, container_proxy = r
         for soa_member in soa_members:
             soa_proxy = container_proxy.data(soa_member[0])
             soa_proxy.save_array(container, soa_member[0], soa_member[1])
 
-        # HACK force updates :
+        # HACK force updates : unsure what is strictly required
+        # specifying refresh is not compatible with Grease Pencil and causes a crash
+        update = False
         if isinstance(bl_item, T.Mesh):
             bl_item.update()
         elif isinstance(bl_item, T.Curve):
             bl_item.twist_mode = bl_item.twist_mode
+        elif isinstance(bl_item, T.GreasePencil):
+            bl_item.update_tag()
+            update = True
+
+        return update
 
     def diff(self, attribute: T.ID, key: Union[int, str], prop: T.Property, context: Context) -> Optional[Delta]:
         """
@@ -443,8 +555,7 @@ class DatablockProxy(StructProxy):
         """
 
         # Create a proxy that will be populated with attributes differences.
-        diff = self.__class__()
-        diff.init(attribute)
+        diff = DatablockProxy.make(attribute)
 
         with context.visit_state.enter_datablock(diff, attribute):
             delta = self._diff(attribute, key, prop, context, diff)

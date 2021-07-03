@@ -22,16 +22,14 @@ import logging
 import os
 import time
 
-from mixer.blender_data import blenddata
-
 logger = logging.Logger(__name__, logging.INFO)
 default_test = "test_module.TestCase.test_name"
 
 
 class DebugDataProperties(bpy.types.PropertyGroup):
-    profile_cumulative: bpy.props.BoolProperty(name="ProfileCumulative", default=False)
-    profile_callers: bpy.props.BoolProperty(name="ProfileCallers", default=False)
-    test_names: bpy.props.StringProperty(name="TestNames", default=default_test)
+    profile_cumulative: bpy.props.BoolProperty(name="ProfileCumulative", default=False)  # type: ignore
+    profile_callers: bpy.props.BoolProperty(name="ProfileCallers", default=False)  # type: ignore
+    test_names: bpy.props.StringProperty(name="TestNames", default=default_test)  # type: ignore
 
 
 proxy = None
@@ -78,8 +76,6 @@ class BuildProxyOperator(bpy.types.Operator):
             print(s.getvalue())
 
         logger.warning(f"Elapse: {t2 - t1} s.")
-        non_empty = proxy.get_non_empty_collections()
-        logger.info(f"Number of non empty collections in proxy: {len(non_empty)}")
 
         # Put breakpoint here and examinate non_empty dictionnary
         return {"FINISHED"}
@@ -124,8 +120,6 @@ class DiffProxyOperator(bpy.types.Operator):
             print(s.getvalue())
 
         logger.warning(f"Elapse: {t2 - t1} s.")
-        non_empty = proxy.get_non_empty_collections()
-        logger.info(f"Number of non empty collections in proxy: {len(non_empty)}")
 
         # Put breakpoint here and examinate non_empty dictionnary
         return {"FINISHED"}
@@ -197,11 +191,9 @@ def register():
         for class_ in classes:
             bpy.utils.register_class(class_)
         bpy.types.WindowManager.debug_data_props = bpy.props.PointerProperty(type=DebugDataProperties)
-    blenddata.register()
 
 
 def unregister():
     if use_debug_addon:
         for class_ in classes:
             bpy.utils.unregister_class(class_)
-    blenddata.unregister()

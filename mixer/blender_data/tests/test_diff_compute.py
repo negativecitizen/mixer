@@ -10,7 +10,7 @@ from mixer.blender_data.bpy_data_proxy import BpyDataProxy
 from mixer.blender_data.datablock_proxy import DatablockProxy
 from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
 from mixer.blender_data.datablock_collection_proxy import DatablockRefCollectionProxy
-from mixer.blender_data.proxy import DeltaAddition, DeltaDeletion, DeltaUpdate
+from mixer.blender_data.proxy import DeltaAddition, DeltaDeletion, DeltaReplace, DeltaUpdate
 from mixer.blender_data.diff import BpyBlendDiff
 from mixer.blender_data.struct_proxy import StructProxy
 
@@ -25,9 +25,15 @@ class DifferentialCompute(unittest.TestCase):
         bpy.ops.wm.open_mainfile(filepath=file)
         self.proxy = BpyDataProxy()
         self.proxy.load(test_properties)
-        self.scene_proxy: DatablockProxy = self.proxy.data("scenes").search_one("Scene")
-        self.scene = bpy.data.scenes["Scene"]
         self.scenes_property = bpy.data.bl_rna.properties["scenes"]
+
+    @property
+    def scene_proxy(self):
+        return self.proxy.data("scenes").search_one("Scene")
+
+    @property
+    def scene(self):
+        return bpy.data.scenes["Scene"]
 
     def generate_all_uuids(self):
         # as a side effect, BpyBlendDiff generates the uuids
@@ -86,7 +92,7 @@ class StructDatablockRef(DifferentialCompute):
         scene_delta = self.scene_proxy.diff(self.scene, self.scene.name, self.scenes_property, self.proxy.context())
         self.assertIsInstance(scene_delta, DeltaUpdate)
         world_delta = scene_delta.value.data("world", resolve_delta=False)
-        self.assertIsInstance(world_delta, DeltaUpdate)
+        self.assertIsInstance(world_delta, DeltaReplace)
         world_update = world_delta.value
         self.assertIsInstance(world_update, DatablockRefProxy)
         self.assertEqual(world_update._datablock_uuid, world.mixer_uuid)
@@ -104,12 +110,11 @@ class StructDatablockRef(DifferentialCompute):
         scene_delta = self.scene_proxy.diff(self.scene, self.scene.name, self.scenes_property, self.proxy.context())
         self.assertIsInstance(scene_delta, DeltaUpdate)
         world_delta = scene_delta.value.data("world", resolve_delta=False)
-        self.assertIsInstance(world_delta, DeltaUpdate)
+        self.assertIsInstance(world_delta, DeltaReplace)
         world_update = world_delta.value
         self.assertIsInstance(world_update, DatablockRefProxy)
         self.assertEqual(world_update._datablock_uuid, world2.mixer_uuid)
 
-    @unittest.skip("Need BpyIDRefNoneProxy")
     def test_remove(self):
         # set reference from a valid datablock to None
         # test_diff_compute.StructDatablockRef.test_remove
@@ -119,13 +124,14 @@ class StructDatablockRef(DifferentialCompute):
         self.proxy.load(test_properties)
         self.scene.world = None
         self.generate_all_uuids()
+        # delta contains valid ref to None
         scene_delta = self.scene_proxy.diff(self.scene, self.scene.name, self.scenes_property, self.proxy.context())
-        # TODO fails. should a null ref be implemented as a DatablockRefProxy
-        # with a null ref (uuid is None)
-        # or what else
         self.assertIsInstance(scene_delta, DeltaUpdate)
-        world_delta = scene_delta.value.data("world")
-        self.assertIsInstance(world_delta, DeltaDeletion)
+        world_delta = scene_delta.value.data("world", resolve_delta=False)
+        self.assertIsInstance(world_delta, DeltaReplace)
+        world_update = world_delta.value
+        self.assertIsInstance(world_update, DatablockRefProxy)
+        self.assertFalse(world_update)
 
 
 class Collection(DifferentialCompute):
@@ -148,8 +154,6 @@ class Collection(DifferentialCompute):
 
         self.proxy = BpyDataProxy()
         self.proxy.load(test_properties)
-        self.scene_proxy = self.proxy.data("scenes").search_one("Scene")
-        self.scene = bpy.data.scenes["Scene"]
         for i in range(2):
             name = f"Added{i}"
             empty = bpy.data.objects.new(name, None)
@@ -164,13 +168,11 @@ class Collection(DifferentialCompute):
         self.assertIsInstance(scene_delta, DeltaUpdate)
         scene_update = scene_delta.value
         self.assertIsInstance(scene_update, DatablockProxy)
-        self.assertTrue(scene_update.is_standalone_datablock)
 
         collection_delta = scene_update.data("collection", resolve_delta=False)
         self.assertIsInstance(scene_delta, DeltaUpdate)
         collection_update = collection_delta.value
-        self.assertIsInstance(collection_update, DatablockProxy)
-        self.assertTrue(collection_update.is_embedded_data)
+        self.assertIsInstance(collection_update, StructProxy)
 
         objects_delta = collection_update.data("objects", resolve_delta=False)
         self.assertIsInstance(objects_delta, DeltaUpdate)
@@ -219,7 +221,6 @@ class Collection(DifferentialCompute):
         self.assertIsInstance(collection_delta, DeltaUpdate)
         collection_update = collection_delta.value
         self.assertIsInstance(collection_update, DatablockProxy)
-        self.assertTrue(collection_update.is_standalone_datablock)
 
         objects_delta = collection_update.data("objects", resolve_delta=False)
         self.assertIsInstance(objects_delta, DeltaUpdate)
@@ -269,7 +270,6 @@ class Aos(DifferentialCompute):
         self.assertIsInstance(mesh_delta, DeltaUpdate)
         mesh_update = mesh_delta.value
         self.assertIsInstance(mesh_update, DatablockProxy)
-        self.assertTrue(mesh_update.is_standalone_datablock)
 
         vertices_delta = mesh_update.data("vertices", resolve_delta=False)
         self.assertIsInstance(vertices_delta, DeltaUpdate)

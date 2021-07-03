@@ -24,15 +24,19 @@ import os
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import bpy
+from bpy_extras.io_utils import ImportHelper
 
+import mixer
 from mixer.share_data import share_data
 from mixer.bl_utils import get_mixer_props, get_mixer_prefs
 from mixer.broadcaster.common import RoomAttributes, ClientAttributes
 from mixer.connection import (
     is_client_connected,
     connect,
+    create_room,
     join_room,
     leave_current_room,
     disconnect,
@@ -43,7 +47,57 @@ logger = logging.getLogger(__name__)
 
 
 poll_is_client_connected = (lambda: is_client_connected(), "Client not connected")
-poll_already_in_a_room = (lambda: not share_data.client.current_room, "Already in a room")
+poll_already_in_a_room = (lambda: not is_client_connected() or not share_data.client.current_room, "Already in a room")
+
+
+class SharedFoldersAddFolderOperator(bpy.types.Operator, ImportHelper):
+    bl_idname = "mixer.add_shared_folder"
+    bl_label = "Add Shared Folder"
+    filepath: bpy.props.StringProperty(subtype="DIR_PATH")
+
+    def execute(self, context):
+
+        path = self.filepath
+        if not Path(path).is_dir():
+            path = str(Path(path).parent)
+
+        for item in get_mixer_prefs().shared_folders:
+            if item.shared_folder == path:
+                return {"FINISHED"}
+
+        item = get_mixer_prefs().shared_folders.add()
+        item.shared_folder = path
+        return {"FINISHED"}
+
+    @classmethod
+    def poll_functors(cls, context):
+        return [
+            poll_already_in_a_room,
+        ]
+
+    @classmethod
+    def poll(cls, context):
+        return generic_poll(cls, context)
+
+
+class SharedFoldersRemoveFolderOperator(bpy.types.Operator):
+    bl_idname = "mixer.remove_shared_folder"
+    bl_label = "Remove Shared Folder"
+
+    def execute(self, context):
+        props = get_mixer_props()
+        get_mixer_prefs().shared_folders.remove(props.shared_folder_index)
+        return {"FINISHED"}
+
+    @classmethod
+    def poll_functors(cls, context):
+        return [
+            poll_already_in_a_room,
+        ]
+
+    @classmethod
+    def poll(cls, context):
+        return generic_poll(cls, context)
 
 
 def generic_poll(cls, context):
@@ -63,7 +117,7 @@ def generic_description(cls, context, properties):
 
 
 class CreateRoomOperator(bpy.types.Operator):
-    """Create a new room on Mixer server"""
+    """Create a new room on Mixer server with the specified name"""
 
     bl_idname = "mixer.create_room"
     bl_label = "Create Room"
@@ -91,10 +145,14 @@ class CreateRoomOperator(bpy.types.Operator):
         if not is_client_connected():
             return {"CANCELLED"}
 
-        prefs = get_mixer_prefs()
-        room = prefs.room
+        mixer_prefs = get_mixer_prefs()
+        room = mixer_prefs.room
         logger.warning(f"CreateRoomOperator.execute({room})")
-        join_room(room, prefs.vrtist_protocol)
+
+        shared_folders = []
+        for item in mixer_prefs.shared_folders:
+            shared_folders.append(item.shared_folder)
+        create_room(room, mixer_prefs.vrtist_protocol, shared_folders, mixer_prefs.ignore_version_check)
 
         return {"FINISHED"}
 
@@ -103,6 +161,16 @@ def get_selected_room_dict():
     room_index = get_mixer_props().room_index
     assert room_index < len(get_mixer_props().rooms)
     return share_data.client.rooms_attributes[get_mixer_props().rooms[room_index].name]
+
+
+def clear_undo_history():
+    # A horrible way to clear the undo stack since we can't do it normally in Blender :(
+    count = bpy.context.preferences.edit.undo_steps + 1
+    try:
+        for _ in range(count):
+            bpy.ops.ed.undo_push(message="Mixer clear history")
+    except RuntimeError:
+        logging.error("Clear history failed")
 
 
 class JoinRoomOperator(bpy.types.Operator):
@@ -119,18 +187,18 @@ class JoinRoomOperator(bpy.types.Operator):
             poll_already_in_a_room,
             (lambda: get_mixer_props().room_index < len(get_mixer_props().rooms), "Invalid room selection"),
             (
-                lambda: (
-                    ("vrtist_protocol" not in get_selected_room_dict() and not get_mixer_prefs().vrtist_protocol)
-                    or (
-                        "vrtist_protocol" in get_selected_room_dict()
-                        and get_mixer_prefs().vrtist_protocol == get_selected_room_dict()["vrtist_protocol"]
-                    )
-                ),
-                "vrtist_protocol flag does not match selected room",
-            ),
-            (
                 lambda: get_selected_room_dict().get(RoomAttributes.JOINABLE, False),
                 "Room is not joinable, first client has not finished sending initial content.",
+            ),
+            (
+                lambda: get_selected_room_dict().get(RoomAttributes.IGNORE_VERSION_CHECK, False)
+                or get_selected_room_dict().get(RoomAttributes.BLENDER_VERSION, "") == bpy.app.version_string,
+                "Room is not joinable, blender version mismatch.",
+            ),
+            (
+                lambda: get_selected_room_dict().get(RoomAttributes.IGNORE_VERSION_CHECK, False)
+                or get_selected_room_dict().get(RoomAttributes.MIXER_VERSION, "") == mixer.display_version,
+                "Room is not joinable, mixer version mismatch.",
             ),
         ]
 
@@ -150,9 +218,22 @@ class JoinRoomOperator(bpy.types.Operator):
         room_index = props.room_index
         room = props.rooms[room_index].name
         logger.warning(f"JoinRoomOperator.execute({room})")
+        room_attributes = get_selected_room_dict()
+        logger.warning(f"Client Blender version: {room_attributes.get(RoomAttributes.BLENDER_VERSION, '')}")
+        logger.warning(f"Client Mixer version: {room_attributes.get(RoomAttributes.MIXER_VERSION, '')}")
 
-        prefs = get_mixer_prefs()
-        join_room(room, prefs.vrtist_protocol)
+        clear_undo_history()
+
+        mixer_prefs = get_mixer_prefs()
+        shared_folders = []
+        for item in mixer_prefs.shared_folders:
+            shared_folders.append(item.shared_folder)
+        join_room(
+            room,
+            not room_attributes.get(RoomAttributes.GENERIC_PROTOCOL, True),
+            shared_folders,
+            mixer_prefs.ignore_version_check,
+        )
 
         return {"FINISHED"}
 
@@ -211,7 +292,10 @@ class DownloadRoomOperator(bpy.types.Operator):
         props = get_mixer_props()
         room_index = props.room_index
         room = props.rooms[room_index].name
-        attributes, commands = download_room(prefs.host, prefs.port, room)
+        protocol = props.rooms[room_index].protocol
+        attributes, commands = download_room(
+            prefs.host, prefs.port, room, bpy.app.version_string, mixer.display_version, protocol == "Generic"
+        )
         save_room(attributes, commands, self.filepath)
 
         return {"FINISHED"}
@@ -335,7 +419,6 @@ class LaunchVRtistOperator(bpy.types.Operator):
         return os.path.isfile(get_mixer_prefs().VRtist)
 
     def execute(self, context):
-        bpy.data.window_managers["WinMan"].mixer.send_base_meshes = False
         bpy.data.window_managers["WinMan"].mixer.send_bake_meshes = True
 
         mixer_prefs = get_mixer_prefs()
@@ -356,7 +439,11 @@ class LaunchVRtistOperator(bpy.types.Operator):
                 return {"CANCELLED"}
 
             logger.warning("LaunchVRtistOperator.execute({mixer_prefs.room})")
-            join_room(mixer_prefs.room, True)
+            shared_folders = []
+            for item in mixer_prefs.shared_folders:
+                shared_folders.append(item.shared_folder)
+            mixer_prefs.ignore_version_check = True
+            join_room(mixer_prefs.room, True, shared_folders, mixer_prefs.ignore_version_check)
 
             # Wait for room creation/join
             timeout = 10
@@ -400,10 +487,42 @@ class LaunchVRtistOperator(bpy.types.Operator):
             color,
             "--username",
             name,
+            "--startScene",
+            os.path.split(bpy.data.filepath)[1],
         ]
         LaunchVRtistOperator.vrtist_process = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False
         )
+        return {"FINISHED"}
+
+
+class ToggleBetweenMixerAndVRtistPanels(bpy.types.Operator):
+    bl_idname = "mixervrtist.toggle"
+    bl_label = "Mixer / VRtist Panels"
+    bl_description = "Toggle Between Mixer and VRtist Panels"
+    bl_options = {"INTERNAL"}
+
+    mixer_desciption = """Toggle from VRtist to Mixer panel.
+Mixer offers a collaborative real-time environment for Blender users.
+\nSee the documentation for more information"""
+    vrtist_desciption = """Toggle from Mixer to VRtist panel.
+This panel will allow you to set up a live link between Blender and VRtist,
+a VR application developed by Ubisoft Animation Studio for immersive animation direction.
+\nSee the documentation for more information"""
+    panel_mode: bpy.props.StringProperty(default="MIXER")
+
+    @classmethod
+    def description(cls, context, properties):
+        descr = "Toggle between Mixer and VRtist panels.\n"
+        if "MIXER" == properties.panel_mode:
+            descr = cls.mixer_desciption
+        elif "VRTIST" == properties.panel_mode:
+            descr = cls.vrtist_desciption
+        return descr
+
+    def invoke(self, context, event):
+        mixer_prefs = get_mixer_prefs()
+        mixer_prefs.display_mixer_vrtist_panels = self.panel_mode
         return {"FINISHED"}
 
 
@@ -417,6 +536,9 @@ classes = (
     LeaveRoomOperator,
     DownloadRoomOperator,
     UploadRoomOperator,
+    SharedFoldersAddFolderOperator,
+    SharedFoldersRemoveFolderOperator,
+    ToggleBetweenMixerAndVRtistPanels,
 )
 
 register_factory, unregister_factory = bpy.utils.register_classes_factory(classes)

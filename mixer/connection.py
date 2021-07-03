@@ -23,6 +23,7 @@ It updates the addon state according to this connection.
 import logging
 
 import bpy
+import mixer
 from mixer.bl_utils import get_mixer_prefs
 from mixer.share_data import share_data
 from mixer.broadcaster.common import ClientAttributes, ClientDisconnectedException
@@ -33,7 +34,7 @@ from pathlib import Path
 from mixer.draw_handlers import remove_draw_handlers
 from mixer.blender_client.client import SendSceneContentFailed, BlenderClient
 from mixer.handlers import HandlerManager
-from mixer.os_utils import tech_infos
+from mixer.os_utils import addon_infos, tech_infos
 
 
 logger = logging.getLogger(__name__)
@@ -48,12 +49,21 @@ def set_client_attributes():
     )
 
 
-def join_room(room_name: str, vrtist_protocol: bool = False):
+def create_room(room_name: str, vrtist_protocol: bool = False, shared_folders=None, ignore_version_check: bool = False):
+    if ignore_version_check:
+        logger.warning("Ignoring version check")
+    join_room(room_name, vrtist_protocol, shared_folders, ignore_version_check)
+
+
+def join_room(room_name: str, vrtist_protocol: bool = False, shared_folders=None, ignore_version_check: bool = False):
     prefs = get_mixer_prefs()
     logger.warning(f"join: room: {room_name}, user: {prefs.user}")
 
     for line in tech_infos():
         logger.warning(line)
+
+    for line in addon_infos():
+        logger.info(line)
 
     assert share_data.client.current_room is None
     share_data.session_id += 1
@@ -62,10 +72,13 @@ def join_room(room_name: str, vrtist_protocol: bool = False):
     share_data.client.current_room = room_name
     share_data.client._joining_room_name = room_name
     set_client_attributes()
-    share_data.client.join_room(room_name)
-    share_data.client.send_set_current_scene(bpy.context.scene.name_full)
+    blender_version = bpy.app.version_string
+    mixer_version = mixer.display_version
+    share_data.client.join_room(room_name, blender_version, mixer_version, ignore_version_check, not vrtist_protocol)
 
-    share_data.set_vrtist_protocol(vrtist_protocol)
+    if shared_folders is None:
+        shared_folders = []
+    share_data.init_protocol(vrtist_protocol, shared_folders)
     share_data.pending_test_update = False
 
     # join a room <==> want to track local changes
@@ -142,6 +155,7 @@ def connect():
     assert is_client_connected()
 
     set_client_attributes()
+    HandlerManager._set_connection_handler(True)
 
 
 def disconnect():
@@ -163,6 +177,7 @@ def disconnect():
         share_data.client = None
 
     update_ui_lists()
+    HandlerManager._set_connection_handler(False)
 
 
 def is_client_connected():

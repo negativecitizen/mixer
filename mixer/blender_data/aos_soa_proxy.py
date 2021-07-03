@@ -31,11 +31,11 @@ from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 import bpy
 import bpy.types as T  # noqa
 
-
-from mixer.blender_data.proxy import DeltaUpdate, Proxy
-from mixer.blender_data.type_helpers import is_vector
-from mixer.blender_data.specifics import soa_initializers
 from mixer.blender_data.attributes import read_attribute, write_attribute
+from mixer.blender_data.json_codec import serialize
+from mixer.blender_data.proxy import DeltaUpdate, Proxy
+from mixer.blender_data.specifics import soa_initializers
+from mixer.blender_data.type_helpers import is_vector
 
 if TYPE_CHECKING:
     from mixer.blender_data.proxy import Context
@@ -56,14 +56,17 @@ def soa_initializer(attr_type, length):
         return element_init * length
 
 
+@serialize
 class AosElement(Proxy):
     """
     Proxy for a member of an soable collection that is not supported by foreach_get()/foreach_set(),
     like SplineBezierPoints[x].handle_left_type
     """
 
+    _serialize = ("_data",)
+
     def __init__(self):
-        self._data: Dict[str, List] = {}
+        self._data: Dict[int, List] = {}
 
     def load(
         self,
@@ -78,7 +81,7 @@ class AosElement(Proxy):
         """
 
         for index, item in enumerate(bl_collection):
-            self._data[index] = read_attribute(getattr(item, attr_name), index, attr_property, context)
+            self._data[index] = read_attribute(getattr(item, attr_name), index, attr_property, bl_collection, context)
 
         try:
             if not isinstance(self._data[0], str):
@@ -101,6 +104,7 @@ class AosElement(Proxy):
             write_attribute(parent[int(index)], key, item, context)
 
 
+@serialize(ctor_args=("_member_name",))
 class SoaElement(Proxy):
     """
     A structure member inside a bpy_prop_collection loaded as a structure of array element
@@ -110,19 +114,19 @@ class SoaElement(Proxy):
 
     _serialize = ("_member_name",)
 
-    def __init__(self):
-        self._array: Optional[array.array] = None
-        self._member_name: Optional[str] = None
+    def __init__(self, member_name: str):
+        self._array = array.array("b", [])
+        self._member_name = member_name
 
-    def array_attr(self, aos: T.bpy_prop_collection, member_name: str, bl_rna: T.bpy_struct) -> Tuple[int, type]:
-        prototype_item = getattr(aos[0], member_name)
+    def array_attr(self, aos: T.bpy_prop_collection, bl_rna: T.bpy_struct) -> Tuple[int, type]:
+        prototype_item = getattr(aos[0], self._member_name)
         member_type = type(prototype_item)
 
         if is_vector(member_type):
             array_size = len(aos) * len(prototype_item)
         elif member_type is T.bpy_prop_array:
             member_type = type(prototype_item[0])
-            if isinstance(bl_rna, T.MeshPolygon) and member_name == "vertices":
+            if isinstance(bl_rna, T.MeshPolygon) and self._member_name == "vertices":
                 # polygon sizes can differ
                 array_size = sum((len(polygon.vertices) for polygon in aos))
             else:
@@ -132,18 +136,17 @@ class SoaElement(Proxy):
 
         return array_size, member_type
 
-    def load(self, aos: bpy.types.bpy_prop_collection, member_name: str, bl_rna: T.bpy_struct, context: Context):
+    def load(self, aos: bpy.types.bpy_prop_collection, bl_rna: T.bpy_struct, context: Context):
         """
         Args:
             aos : The array or structures collection that contains this member (e.g.  a_mesh.vertices, a_mesh.edges, ...)
             member_name : The name of this aos member (e.g, "co", "normal", ...)
             prototype_item : an element of parent collection
         """
-        self._member_name = member_name
         if len(aos) == 0:
             self._array = array.array("b", [])
         else:
-            array_size, member_type = self.array_attr(aos, member_name, bl_rna)
+            array_size, member_type = self.array_attr(aos, bl_rna)
             typecode = soa_initializers[member_type].typecode
             buffer = self._array
             if buffer is None or buffer.buffer_info()[1] != array_size or buffer.typecode != typecode:
@@ -152,7 +155,7 @@ class SoaElement(Proxy):
             # if foreach_get() raises "RuntimeError: internal error setting the array"
             # it means that the array is ill-formed.
             # Check rna_access.c:rna_raw_access()
-            aos.foreach_get(member_name, self._array)
+            aos.foreach_get(self._member_name, self._array)
         self._attach(context)
         return self
 
@@ -160,7 +163,10 @@ class SoaElement(Proxy):
         """Attach the buffer to the DatablockProxy or DeltaUpdate"""
         # Store the buffer information at the root of the datablock so that it is easy to find it for serialization
         visit_state = context.visit_state
-        parent_path = tuple(visit_state.path)
+
+        # path to the bl_collection that contains the element managed by this proxy,
+        # e.g ("vertices") if this proxy manages a Mesh.vertices element
+        parent_path = visit_state.path()[:-1]
         root = visit_state.datablock_proxy
         root._soas[parent_path].append((self._member_name, self))
 
@@ -170,9 +176,10 @@ class SoaElement(Proxy):
         Args:
             key: the name of the structure member (e.g "co")
         """
-        self._member_name = key
+        assert self._member_name == key
 
     def save_array(self, aos: T.bpy_prop_collection, member_name, array_: array.array):
+        assert member_name == self._member_name
         if logger.isEnabledFor(logging.DEBUG):
             message = f"save_array {aos}.{member_name}"
             if self._array is not None:
@@ -185,7 +192,7 @@ class SoaElement(Proxy):
         try:
             aos.foreach_set(member_name, array_)
         except RuntimeError as e:
-            logger.error(f"saving soa {aos}.{member_name} failed")
+            logger.error(f"saving soa {aos!r}[].{member_name} failed")
             logger.error(f"... member size: {len(aos)}, array: ('{array_.typecode}', {len(array_)})")
             logger.error(f"... exception {e!r}")
 
@@ -220,7 +227,7 @@ class SoaElement(Proxy):
         if len(aos) == 0:
             return None
 
-        array_size, member_type = self.array_attr(aos, self._member_name, prop.bl_rna)
+        array_size, member_type = self.array_attr(aos, prop.bl_rna)
         typecode = self._array.typecode
         tmp_array = array.array(typecode, soa_initializer(member_type, array_size))
         if logger.isEnabledFor(logging.DEBUG):
@@ -239,8 +246,7 @@ class SoaElement(Proxy):
         if self._array == tmp_array:
             return None
 
-        diff = self.__class__()
-        diff._member_name = self._member_name
+        diff = self.__class__(self._member_name)
         diff._array = tmp_array
         diff._attach(context)
         return DeltaUpdate(diff)

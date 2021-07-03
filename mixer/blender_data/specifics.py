@@ -27,12 +27,13 @@ to control behavior with plugin data.
 from __future__ import annotations
 
 import array
+from functools import lru_cache
 import logging
 from pathlib import Path
-import traceback
-from typing import Any, Callable, Dict, ItemsView, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, cast, Dict, ItemsView, List, Optional, Tuple, TYPE_CHECKING, Union
 
-from mixer.local_data import get_resolved_file_path
+from mixer.blender_data.proxy import AddElementFailed, ExternalFileFailed
+
 
 import bpy
 import bpy.types as T  # noqa N812
@@ -42,7 +43,6 @@ import mathutils
 if TYPE_CHECKING:
     from mixer.blender_data.aos_proxy import AosProxy
     from mixer.blender_data.datablock_proxy import DatablockProxy
-    from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
     from mixer.blender_data.proxy import Context, Proxy
 
 logger = logging.getLogger(__name__)
@@ -50,30 +50,36 @@ logger = logging.getLogger(__name__)
 
 # Beware that MeshVertex must be handled as SOA although "groups" is a variable length item.
 # Enums are not handled by foreach_get()
-soable_collection_properties = {
-    T.GPencilStroke.bl_rna.properties["points"],
-    T.GPencilStroke.bl_rna.properties["triangles"],
-    T.Mesh.bl_rna.properties["edges"],
-    T.Mesh.bl_rna.properties["loops"],
-    T.Mesh.bl_rna.properties["loop_triangles"],
-    T.Mesh.bl_rna.properties["polygons"],
-    T.Mesh.bl_rna.properties["vertices"],
-    T.MeshFaceMapLayer.bl_rna.properties["data"],
-    T.MeshLoopColorLayer.bl_rna.properties["data"],
-    T.MeshUVLoopLayer.bl_rna.properties["data"],
-    T.ShapeKey.bl_rna.properties["data"],
-    T.Spline.bl_rna.properties["bezier_points"],
-}
-_resize_geometry_types = tuple(
-    type(t.bl_rna)
-    for t in [
-        T.MeshEdges,
-        T.MeshLoops,
-        T.MeshLoopTriangles,
-        T.MeshPolygons,
-        T.MeshVertices,
-    ]
-)
+@lru_cache(None)
+def soable_collection_properties():
+    return {
+        T.GPencilStroke.bl_rna.properties["points"],
+        T.GPencilStroke.bl_rna.properties["triangles"],
+        T.Mesh.bl_rna.properties["edges"],
+        T.Mesh.bl_rna.properties["loops"],
+        T.Mesh.bl_rna.properties["loop_triangles"],
+        T.Mesh.bl_rna.properties["polygons"],
+        T.Mesh.bl_rna.properties["vertices"],
+        T.MeshFaceMapLayer.bl_rna.properties["data"],
+        T.MeshLoopColorLayer.bl_rna.properties["data"],
+        T.MeshUVLoopLayer.bl_rna.properties["data"],
+        T.ShapeKey.bl_rna.properties["data"],
+        T.Spline.bl_rna.properties["bezier_points"],
+    }
+
+
+@lru_cache(None)
+def _resize_geometry_types():
+    return tuple(
+        type(t.bl_rna)
+        for t in [
+            T.MeshEdges,
+            T.MeshLoops,
+            T.MeshLoopTriangles,
+            T.MeshPolygons,
+            T.MeshVertices,
+        ]
+    )
 
 
 # in sync with soa_initializers
@@ -89,12 +95,16 @@ soable_properties = (
 # in sync with soable_properties
 soa_initializers: Dict[type, array.array] = {
     bool: array.array("b", [0]),
-    int: array.array("l", [0]),
+    int: array.array("i", [0]),  # has same itemsize (4) on Linux and Windows
     float: array.array("f", [0.0]),
     mathutils.Vector: array.array("f", [0.0]),
     mathutils.Color: array.array("f", [0.0]),
     mathutils.Quaternion: array.array("f", [0.0]),
 }
+
+_node_groups: Tuple[type, ...] = (T.ShaderNodeGroup, T.CompositorNodeGroup, T.TextureNodeGroup)
+if bpy.app.version is not None and bpy.app.version >= (2, 92, 0):
+    _node_groups = _node_groups + (T.GeometryNodeGroup,)
 
 
 def dispatch_rna(no_rna_impl: Callable[..., Any]):
@@ -186,18 +196,11 @@ def dispatch_value(default_func):
 
 
 def is_soable_collection(prop):
-    return prop in soable_collection_properties
+    return prop in soable_collection_properties()
 
 
 def is_soable_property(bl_rna_property):
     return isinstance(bl_rna_property, soable_properties)
-
-
-node_tree_type = {
-    "SHADER": "ShaderNodeTree",
-    "COMPOSITOR": "CompositorNodeTree",
-    "TEXTURE": "TextureNodeTree",
-}
 
 
 @dispatch_value
@@ -219,47 +222,67 @@ def bpy_data_ctor(collection_name: str, proxy: DatablockProxy, context: Any) -> 
     return id_
 
 
-@bpy_data_ctor.register("images")
-def bpy_data_ctor_images(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
-    collection = getattr(bpy.data, collection_name)
-    image = None
-    image_name = proxy.data("name")
+@bpy_data_ctor.register("fonts")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> T.VectorFont:
+    name = proxy.data("name")
     filepath = proxy.data("filepath")
-    resolved_filepath = get_resolved_file_path(filepath)
+
+    if filepath != "<builtin>":
+        raise NotImplementedError(f"non builtin font: {name}")
+
+    dummy_text = bpy.data.curves.new("_mixer_tmp_text", "FONT")
+    font = dummy_text.font
+    bpy.data.curves.remove(dummy_text)
+    return font
+
+
+@bpy_data_ctor.register("images")  # type: ignore[no-redef]
+@bpy_data_ctor.register("movieclips")
+@bpy_data_ctor.register("sounds")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+    collection = getattr(bpy.data, collection_name)
+    media = None
+    media_name = proxy.data("name")
+    filepath = proxy.data("filepath")
+
+    resolved_filepath = proxy.resolved_filepath(context)
+    if resolved_filepath is None:
+        return None
+
     packed_files = proxy.data("packed_files")
     if packed_files is not None and packed_files.length:
-        name = proxy.data("name")
-        width, height = proxy.data("size")
-        try:
-            with open(resolved_filepath, "rb") as image_file:
-                buffer = image_file.read()
-            image = collection.new(name, width, height)
-            image.pack(data=buffer, data_len=len(buffer))
-        except RuntimeError as e:
-            logger.warning(
-                f'Cannot load packed image original "{filepath}"", resolved "{resolved_filepath}". Exception: '
-            )
-            logger.warning(f"... {e}")
-            return None
+        if collection_name == "images":
+            width, height = proxy.data("size")
+            try:
+                with open(resolved_filepath, "rb") as file_:
+                    buffer = file_.read()
+                media = collection.new(media_name, width, height)
+                media.pack(data=buffer, data_len=len(buffer))
+            except RuntimeError as e:
+                logger.warning(
+                    f'Cannot load packed file original "{filepath}"", resolved "{resolved_filepath}". Exception: '
+                )
+                logger.warning(f"... {e}")
+                raise ExternalFileFailed from e
 
     else:
         try:
-            image = collection.load(resolved_filepath)
-            image.name = image_name
+            media = collection.load(resolved_filepath)
+            media.name = media_name
         except RuntimeError as e:
-            logger.warning(f'Cannot load image original "{filepath}"", resolved "{resolved_filepath}". Exception: ')
+            logger.warning(f'Cannot load file original "{filepath}"", resolved "{resolved_filepath}". Exception: ')
             logger.warning(f"... {e}")
-            return None
+            raise ExternalFileFailed from e
 
     # prevent filepath to be overwritten by the incoming proxy value as it would attempt to reload the file
     # from the incoming path that may not exist
     proxy._data["filepath"] = resolved_filepath
     proxy._data["filepath_raw"] = resolved_filepath
-    return image
+    return media
 
 
-@bpy_data_ctor.register("objects")
-def bpy_data_ctor_objects(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+@bpy_data_ctor.register("objects")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
     from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
     from mixer.blender_data.misc_proxies import NonePtrProxy
 
@@ -277,150 +300,210 @@ def bpy_data_ctor_objects(collection_name: str, proxy: DatablockProxy, context: 
         logger.warning("... loaded as Empty")
         data_datablock = None
 
-    object_datablock = collection.new(name, data_datablock)
-
-    if data_datablock is not None:
-        context.proxy_state.objects[data_datablock.mixer_uuid].add(proxy.mixer_uuid)
-
-    return object_datablock
+    return collection.new(name, data_datablock)
 
 
-@bpy_data_ctor.register("lights")
-def bpy_data_ctor_lights(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+@bpy_data_ctor.register("node_groups")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
     collection = getattr(bpy.data, collection_name)
     name = proxy.data("name")
-    light_type = proxy.data("type")
-    light = collection.new(name, light_type)
-    return light
+    bl_idname = proxy.data("bl_idname")
+    return collection.new(name, bl_idname)
 
 
-@bpy_data_ctor.register("node_groups")
-def bpy_data_ctor_node_groups(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+@bpy_data_ctor.register("lights")  # type: ignore[no-redef]
+@bpy_data_ctor.register("textures")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
     collection = getattr(bpy.data, collection_name)
     name = proxy.data("name")
-    type_ = node_tree_type[proxy.data("type")]
+    type_ = proxy.data("type")
     return collection.new(name, type_)
 
 
-@bpy_data_ctor.register("sounds")
-def bpy_data_ctor_sounds(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
-    collection = getattr(bpy.data, collection_name)
-    filepath = proxy.data("filepath")
-    # TODO what about "check_existing" ?
-    id_ = collection.load(filepath)
-    # we may have received an ID named xxx.001 although filepath is xxx, so fix it now
-    id_.name = proxy.data("name")
-    return id_
+_curve_ids = {
+    "Curve": "CURVE",
+    "SurfaceCurve": "SURFACE",
+    "TextCurve": "FONT",
+}
 
 
-@bpy_data_ctor.register("curves")
-def bpy_data_ctor_curves(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+@bpy_data_ctor.register("curves")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
     collection = getattr(bpy.data, collection_name)
     name = proxy.data("name")
-    return collection.new(name, "CURVE")
+    curve_type = proxy._type_name
+    return collection.new(name, _curve_ids[curve_type])
 
 
-@bpy_data_ctor.register("shape_keys")
-def bpy_data_ctor_shape_keys(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
+@bpy_data_ctor.register("shape_keys")  # type: ignore[no-redef]
+def _(collection_name: str, proxy: DatablockProxy, context: Context) -> Optional[T.ID]:
     user = proxy._data["user"]
     user_proxy = context.proxy_state.proxies.get(user.mixer_uuid)
     datablock = proxy.create_shape_key_datablock(user_proxy, context)
     return datablock
 
 
-filter_crop_transform = [
-    T.EffectSequence,
-    T.ImageSequence,
-    T.MaskSequence,
-    T.MetaSequence,
-    T.MovieClipSequence,
-    T.MovieSequence,
-    T.SceneSequence,
-]
+def _filter_properties(properties: ItemsView, exclude_names: List[str]) -> ItemsView:
+    filtered = {k: v for k, v in properties if k not in exclude_names}
+    return filtered.items()
 
 
+@dispatch_rna
 def conditional_properties(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
-    """Filter properties list according to a specific property value in the same ID
+    """Filter properties list according to a specific property value in the same structure.
 
     This prevents loading values that cannot always be saved, such as Object.instance_collection
     that can only be saved when Object.data is None
 
     Args:
-        properties: the properties list to filter
+        bpy_struct: the structure
+        properties: a view into a Dict[str, bpy.types.Property] to filter
     Returns:
-
+        The filtered properties
     """
-    if isinstance(bpy_struct, T.ColorManagedViewSettings):
-        if bpy_struct.use_curve_mapping:
-            # Empty
-            return properties
-        filtered = {}
-        filter_props = ["curve_mapping"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
+    return properties
 
-    if isinstance(bpy_struct, T.Object):
-        if not bpy_struct.data:
-            # Empty
-            return properties
-        filtered = {}
-        filter_props = ["instance_collection"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
 
-    if isinstance(bpy_struct, T.Mesh):
-        if not bpy_struct.use_auto_texspace:
-            # Empty
-            return properties
-        filtered = {}
-        filter_props = ["texspace_location", "texspace_size"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
+@conditional_properties.register(T.ColorManagedViewSettings)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if bpy_struct.use_curve_mapping:
+        return properties
+    filter_props = ["curve_mapping"]
+    return _filter_properties(properties, filter_props)
 
-    if isinstance(bpy_struct, (T.MetaBall, T.Curve)):
-        if not bpy_struct.use_auto_texspace:
-            return properties
-        filter_props = ["texspace_location", "texspace_size"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
 
-    if isinstance(bpy_struct, T.Node):
-        if bpy_struct.hide:
-            return properties
+@conditional_properties.register(T.Object)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if not bpy_struct.data:
+        return properties
 
-        # not hidden: saving width_hidden is ignored
-        filter_props = ["width_hidden"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
+    filter_props = ["instance_collection"]
+    return _filter_properties(properties, filter_props)
 
-    if isinstance(bpy_struct, T.NodeTree):
-        if not bpy_struct.is_embedded_data:
-            return properties
 
-        filter_props = ["name"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
+@conditional_properties.register(T.Curve)  # type: ignore[no-redef]
+@conditional_properties.register(T.Mesh)  # type: ignore[no-redef]
+@conditional_properties.register(T.MetaBall)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if not bpy_struct.use_auto_texspace:
+        return properties
 
-    if isinstance(bpy_struct, T.LayerCollection):
-        scene = bpy_struct.id_data
-        if bpy_struct.collection != scene.collection:
-            return properties
+    filter_props = ["texspace_location", "texspace_size"]
+    return _filter_properties(properties, filter_props)
 
-        filter_props = ["exclude"]
-        filtered = {k: v for k, v in properties if k not in filter_props}
-        return filtered.items()
 
+@conditional_properties.register(T.Node)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if bpy_struct.hide:
+        return properties
+
+    # not hidden: saving width_hidden is ignored
+    filter_props = ["width_hidden"]
+
+    if isinstance(bpy_struct, T.NodeReroute):
+        filter_props.extend(
+            [
+                # cannot be set !!
+                "width"
+            ]
+        )
+
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.NodeGroupInput)  # type: ignore[no-redef]
+@conditional_properties.register(T.NodeGroupOutput)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    # For nodes of type NodeGroupInput and NodeGroupOutput, do not save inputs and outputs,
+    # which are created created/updated via NodeTree.inputs and NoteTree.outputs
+    filter_props = ["inputs", "outputs"]
+    if not bpy_struct.hide:
+        # same as for Node
+        filter_props.append("width_hidden")
+
+    filtered = {k: v for k, v in properties if k not in filter_props}
+    return filtered.items()
+
+
+@conditional_properties.register(T.NodeSocket)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    # keep identifier for XxxNodeGroup only
+    if isinstance(bpy_struct.node, _node_groups):
+        return properties
+
+    filter_props = [
+        "identifier",
+        # saving bl_idname for NodeReroute (and others ?) cause havoc
+        "bl_idname",
+    ]
+
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.NodeTree)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if not bpy_struct.is_embedded_data:
+        return properties
+
+    filter_props = ["name"]
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.LayerCollection)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    scene = bpy_struct.id_data
+    if bpy_struct.collection != scene.collection:
+        return properties
+
+    filter_props = ["exclude"]
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.UnitSettings)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if bpy_struct.system != "NONE":
+        return properties
+
+    filter_props = ["length_unit", "mass_unit", "time_unit", "temperature_unit"]
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.FCurve)  # type: ignore[no-redef]
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if bpy_struct.group is not None:
+        return properties
+
+    # FCurve.group = None
+    # triggers noisy message
+    # ERROR: one of the ID's for the groups to assign to is invalid (ptr=0000028B55B0C038, val=0000000000000000)
+    filter_props = ["group"]
+    return _filter_properties(properties, filter_props)
+
+
+@conditional_properties.register(T.EffectSequence)  # type: ignore[no-redef]
+@conditional_properties.register(T.ImageSequence)
+@conditional_properties.register(T.MaskSequence)
+@conditional_properties.register(T.MetaSequence)
+@conditional_properties.register(T.MovieClipSequence)
+@conditional_properties.register(T.MovieSequence)
+@conditional_properties.register(T.SceneSequence)
+def _(bpy_struct: T.Struct, properties: ItemsView) -> ItemsView:
+    if bpy.app.version >= (2, 92, 0):
+        return properties
     filter_props = []
-    if any(isinstance(bpy_struct, t) for t in filter_crop_transform):
-        if not bpy_struct.use_crop:
-            filter_props.append("crop")
-        if not bpy_struct.use_translation:
-            filter_props.append("transform")
+    if not bpy_struct.use_crop:
+        filter_props.append("crop")
+    if not bpy_struct.use_translation:
+        filter_props.append("transform")
 
     if not filter_props:
         return properties
-    filtered = {k: v for k, v in properties if k not in filter_props}
-    return filtered.items()
+
+    return _filter_properties(properties, filter_props)
+
+
+_morphable_types = (T.Light, T.Texture)
+"""Datablock types that may change and need type_recast type after modification of their type attribute."""
 
 
 def pre_save_datablock(proxy: DatablockProxy, target: T.ID, context: Context) -> T.ID:
@@ -430,8 +513,17 @@ def pre_save_datablock(proxy: DatablockProxy, target: T.ID, context: Context) ->
     # When called from save, the proxy has  all the synchronized properties
     # WHen called from apply, the proxy only contains the updated properties
 
-    if isinstance(target, T.Mesh) and proxy.requires_clear_geometry(target):
-        target.clear_geometry()
+    if target.library:
+        return target
+
+    #  animation_data is handled in StructProxy (parent class of DatablockProxy)
+
+    if isinstance(target, T.Mesh):
+        from mixer.blender_data.mesh_proxy import MeshProxy
+
+        assert isinstance(proxy, MeshProxy)
+        if proxy.requires_clear_geometry(target):
+            target.clear_geometry()
     elif isinstance(target, T.Material):
         is_grease_pencil = proxy.data("is_grease_pencil")
         # will be None for a DeltaUpdate that does not modify "is_grease_pencil"
@@ -451,13 +543,20 @@ def pre_save_datablock(proxy: DatablockProxy, target: T.ID, context: Context) ->
                 target.sequence_editor_create()
             elif isinstance(sequence_editor, NonePtrProxy) and target.sequence_editor is not None:
                 target.sequence_editor_clear()
-    elif isinstance(target, T.Light):
-        # required first to have access to new light type attributes
-        light_type = proxy.data("type")
-        if light_type is not None and light_type != target.type:
-            target.type = light_type
+    elif isinstance(target, _morphable_types):
+        # required first to have access to new datablock attributes
+        type_ = proxy.data("type")
+        if type_ is not None and type_ != target.type:
+            target.type = type_
             # must reload the reference
-            target = proxy.target(context)
+            target = target.type_recast()
+            uuid = proxy.mixer_uuid
+            context.proxy_state.remove_datablock(uuid)
+            context.proxy_state.add_datablock(uuid, target)
+    elif isinstance(target, T.Action):
+        groups = proxy.data("groups")
+        if groups:
+            groups.save(target.groups, target, "groups", context)
 
     return target
 
@@ -466,33 +565,42 @@ def pre_save_datablock(proxy: DatablockProxy, target: T.ID, context: Context) ->
 # add_element
 #
 @dispatch_rna
-def add_element(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
-    """Add an element to a bpy_prop_collection using the collection specific API"""
-    try:
-        collection.bl_rna
-    except AttributeError:
-        return
+def add_element(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context):
+    """Add an element to a bpy_prop_collection using the collection specific API.s"""
 
-    try:
-        collection.add()
-    except Exception:
-        logger.error(f"add_element: failed for {collection}")
+    if hasattr(collection, "add"):
+        # either a bpy_prop_collection  with an rna or a bpy_prop_collection_idprop
+        try:
+            collection.add()
+            return
+        except Exception as e:
+            logger.error(f"add_element: call to add() failed for {context.visit_state.display_path()} ...")
+            logger.error(f"... {e!r}")
+            raise AddElementFailed from None
+
+    if not hasattr(collection, "bl_rna"):
+        # a bpy.types.bpy_prop_collection, e.g Pose.bones
+        # We should not even attempt to add elements in these collections since they do not allow it at all.
+        # However bpy_prop_collection and collections with an rna both managed by StructCollectionProxy. We need
+        # proxy update to update the contents of existing elements, but it should not attempt to add/remove elements.
+        # As a consequence, for attributes that fall into this category we trigger updates with additions and
+        # deletions that are meaningless. Ignore them.
+        # The right design could be to have different proxies for bpy_prop_collection and bpy_struct that behave like
+        # collections.
+        # see Proxy construction in  read_attribute()
+        return
 
 
 @add_element.register_default()
-def _add_element_default(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+def _add_element_default(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     try:
-        return collection.add()
-    except Exception:
-        pass
-
-    # try our best
-    new_or_add = getattr(collection, "new", None)
-    if new_or_add is None:
-        new_or_add = getattr(collection, "add", None)
-    if new_or_add is None:
-        logger.warning(f"Not implemented: add_element for {collection} ...")
-        return None
+        new_or_add = collection.new
+    except AttributeError:
+        try:
+            new_or_add = collection.add
+        except AttributeError:
+            logger.error(f"add_element: not implemented for {context.visit_state.display_path()} ...")
+            raise AddElementFailed from None
 
     try:
         return new_or_add()
@@ -500,93 +608,119 @@ def _add_element_default(collection: T.bpy_prop_collection, proxy: Proxy, contex
         try:
             key = proxy.data("name")
             return new_or_add(key)
-        except Exception:
-            logger.warning(f"Not implemented: add_element for type {type(collection)} for {collection}[{key}] ...")
-            for s in traceback.format_exc().splitlines():
-                logger.warning(f"...{s}")
-    return None
+        except Exception as e:
+            logger.error(f"add_element: not implemented for {context.visit_state.display_path()} ...")
+            logger.error(f"... {e!r}")
+            raise AddElementFailed from None
 
 
-@add_element.register(T.NodeInputs)
-@add_element.register(T.NodeOutputs)
-@add_element.register(T.NodeTreeInputs)
-@add_element.register(T.NodeTreeOutputs)
-def _add_element_type_name(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
-    socket_type = proxy.data("type")
+@add_element.register(T.NodeInputs)  # type: ignore[no-redef]
+@add_element.register(T.NodeOutputs)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    node = context.visit_state.attribute(-1)
+    if not isinstance(node, _node_groups):
+        logger.warning(f"Unexpected add node input for {node} at {context.visit_path.path()}")
+
+    socket_type = proxy.data("bl_idname")
     name = proxy.data("name")
     return collection.new(socket_type, name)
 
 
+@add_element.register(T.NodeTreeInputs)  # type: ignore[no-redef]
+@add_element.register(T.NodeTreeOutputs)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    socket_type = proxy.data("bl_socket_idname")
+    name = proxy.data("name")
+    return collection.new(socket_type, name)
+
+
+@add_element.register(T.ObjectGpencilModifiers)  # type: ignore[no-redef]
 @add_element.register(T.ObjectModifiers)
-@add_element.register(T.ObjectGpencilModifiers)
-@add_element.register(T.SequenceModifiers)
-def _add_element_name_type(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.ObjectShaderFx)  # type: ignore[no-redef]
+@add_element.register(T.SequenceModifiers)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     name = proxy.data("name")
     type_ = proxy.data("type")
     return collection.new(name, type_)
 
 
+@add_element.register(T.CurveSplines)  # type: ignore[no-redef]
+@add_element.register(T.FCurveModifiers)
 @add_element.register(T.ObjectConstraints)
-@add_element.register(T.CurveSplines)
-def _add_element_type(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.PoseBoneConstraints)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     type_ = proxy.data("type")
     return collection.new(type_)
 
 
-@add_element.register(T.SplinePoints)
-@add_element.register(T.SplineBezierPoints)
-def _add_element_one(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.SplinePoints)  # type: ignore[no-redef]
+@add_element.register(T.SplineBezierPoints)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     return collection.add(1)
 
 
-@add_element.register(T.MetaBallElements)
-def _add_element_type_eq(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.MetaBallElements)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     type_ = proxy.data("type")
     return collection.new(type=type_)
 
 
-@add_element.register(T.CurveMapPoints)
-def _add_element_location(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.CurveMapPoints)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     location = proxy.data("location")
     return collection.new(location[0], location[1])
 
 
-@add_element.register(T.Nodes)
-def _add_element_idname(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.Nodes)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     node_type = proxy.data("bl_idname")
-    return collection.new(node_type)
+    try:
+        return collection.new(node_type)
+    except RuntimeError as e:
+        name = proxy.data("name")
+        logger.error(f"add_element failed for node {name!r} into {context.visit_state.display_path()} ...")
+        logger.error(f"... {e!r}")
+        raise AddElementFailed from None
 
 
-@add_element.register(T.UVLoopLayers)
-@add_element.register(T.LoopColors)
+@add_element.register(T.ActionGroups)  # type: ignore[no-redef]
 @add_element.register(T.FaceMaps)
-@add_element.register(T.VertexGroups)
-def _add_element_name_eq(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.LoopColors)
+@add_element.register(T.TimelineMarkers)
+@add_element.register(T.UVLoopLayers)
+@add_element.register(T.VertexGroups)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     name = proxy.data("name")
     return collection.new(name=name)
 
 
-@add_element.register(T.GreasePencilLayers)
-def _add_element_info(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.ArmatureEditBones)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    name = proxy.data("name")
+    return collection.new(name)
+
+
+@add_element.register(T.GreasePencilLayers)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     name = proxy.data("info")
     return collection.new(name)
 
 
-@add_element.register(T.GPencilFrames)
-def _add_element_frame_number(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.GPencilFrames)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     frame_number = proxy.data("frame_number")
     return collection.new(frame_number)
 
 
-@add_element.register(T.KeyingSets)
-def _add_element_bl_label(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.KeyingSets)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     label = proxy.data("bl_label")
     idname = proxy.data("bl_idname")
     return collection.new(name=label, idname=idname)
 
 
-@add_element.register(T.KeyingSetPaths)
-def _add_element_keyingset(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.KeyingSetPaths)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     # TODO current implementation fails
     # All keying sets paths have an empty name, and insertion with add() fails
     # with an empty name
@@ -604,17 +738,56 @@ def _add_element_keyingset(collection: T.bpy_prop_collection, proxy: Proxy, cont
     )
 
 
+@add_element.register(T.AnimDataDrivers)  # type: ignore[no-redef]
+@add_element.register(T.ActionFCurves)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    data_path = proxy.data("data_path")
+    array_index = proxy.data("array_index")
+    return collection.new(data_path, index=array_index)
+
+
+@add_element.register(T.FCurveKeyframePoints)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    return collection.add(1)
+
+
+@add_element.register(T.AttributeGroup)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    name = proxy.data("name")
+    type_ = proxy.data("type")
+    domain = proxy.data("domain")
+    return collection.new(name, type_, domain)
+
+
 _non_effect_sequences = {"IMAGE", "SOUND", "META", "SCENE", "MOVIE", "MOVIECLIP", "MASK"}
-_effect_sequences = set(T.EffectSequence.bl_rna.properties["type"].enum_items.keys()) - _non_effect_sequences
 
 
-@add_element.register(T.Sequences)
-def _add_element_sequence(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@lru_cache(None)
+def _effect_sequences():
+    return set(T.EffectSequence.bl_rna.properties["type"].enum_items.keys()) - _non_effect_sequences
+
+
+@lru_cache(None)
+def _version():
+    version = bpy.app.version
+    if not isinstance(version, tuple):
+        return (0,)
+    return version
+
+
+if _version() < (2, 92, 0):
+    _Sequences = T.Sequences
+else:
+    _Sequences = T.SequencesTopLevel
+
+
+@add_element.register(_Sequences)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     type_name = proxy.data("type")
     name = proxy.data("name")
     channel = proxy.data("channel")
     frame_start = proxy.data("frame_start")
-    if type_name in _effect_sequences:
+    if type_name in _effect_sequences():
         # overwritten anyway
         frame_end = frame_start + 1
         return collection.new_effect(name, type_name, channel, frame_start, frame_end=frame_end)
@@ -639,10 +812,16 @@ def _add_element_sequence(collection: T.bpy_prop_collection, proxy: Proxy, conte
     return None
 
 
-@add_element.register(T.IDMaterials)
-def _add_element_material_ref(collection: T.bpy_prop_collection, proxy: Proxy, context: Context):
+@add_element.register(T.IDMaterials)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
     material_datablock = proxy.target(context)
     return collection.append(material_datablock)
+
+
+@add_element.register(T.ColorRampElements)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, proxy: Proxy, index: int, context: Context) -> T.bpy_struct:
+    position = proxy.data("position")
+    return collection.new(position)
 
 
 def fit_aos(target: T.bpy_prop_collection, proxy: AosProxy, context: Context):
@@ -654,7 +833,7 @@ def fit_aos(target: T.bpy_prop_collection, proxy: AosProxy, context: Context):
         return
 
     target_rna = target.bl_rna
-    if isinstance(target_rna, _resize_geometry_types):
+    if isinstance(target_rna, _resize_geometry_types()):
         existing_length = len(target)
         incoming_length = len(proxy)
         if existing_length != incoming_length:
@@ -694,8 +873,31 @@ def fit_aos(target: T.bpy_prop_collection, proxy: AosProxy, context: Context):
 #
 # must_replace
 #
-_object_material_slots_property = T.Object.bl_rna.properties["material_slots"]
-_key_key_blocks_property = T.Key.bl_rna.properties["key_blocks"]
+@lru_cache(None)
+def _object_material_slots_property():
+    return T.Object.bl_rna.properties["material_slots"]
+
+
+@lru_cache(None)
+def _key_blocks_property():
+    return T.Key.bl_rna.properties["key_blocks"]
+
+
+@dispatch_rna
+def can_resize(collection: T.bpy_prop_collection, context: Context) -> bool:
+    """Returns True if the collection can safely be resized."""
+    return True
+
+
+@can_resize.register(T.NodeInputs)  # type: ignore[no-redef]
+@can_resize.register(T.NodeOutputs)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, context: Context) -> bool:
+    # in XxxNodeGroups, the number of sockets is controlled by the inner NodeGroup.inputs and NodeGroup.outputs
+    # Extending the collection in XxxNodeGroup would create the socket twice (once in the XXXNodeGroup and once
+    # in NodeTree.inputs or outputs).
+    # The existing items in XxxNodeGroup.inputs and outputs must be saved as they contain the socket default_value
+    node = context.visit_state.attribute(-2)
+    return not isinstance(node, _node_groups)
 
 
 @dispatch_rna
@@ -704,10 +906,12 @@ def diff_must_replace(
 ) -> bool:
     """
     Returns True if a diff between the proxy sequence state and the Blender collection state must force a
-    full collection replacement
+    full collection replacement.
     """
 
-    if collection_property == _object_material_slots_property:
+    if collection_property == _object_material_slots_property():
+        from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
+
         # Object.material_slots has no bl_rna, so rely on the property to identify it
         # TODO should we change to a dispatch on the property value ?
         from mixer.blender_data.misc_proxies import NonePtrProxy
@@ -729,30 +933,32 @@ def diff_must_replace(
             if bl_item.link != proxy.data("link"):
                 return True
 
-    elif collection_property == _key_key_blocks_property:
+    elif collection_property == _key_blocks_property():
         if len(collection) != len(sequence):
             return True
         for bl_item, proxy in zip(collection, sequence):
             if bl_item.name != proxy.data("name"):
                 return True
-            if bl_item.relative_key.name != proxy.data("relative_key"):
-                # see ShapeKeyProxy.load()
-                return True
 
     return False
 
 
-@diff_must_replace.register(T.CurveSplines)
-def _diff_must_replace_always(
-    collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property
-) -> bool:
+@diff_must_replace.register(T.CurveSplines)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property) -> bool:
     return True
 
 
-@diff_must_replace.register(T.VertexGroups)
-def _diff_must_replace_vertex_groups(
-    collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property
-) -> bool:
+@diff_must_replace.register(T.ArmatureEditBones)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property) -> bool:
+    # HACK
+    # Without forcing a full update, using rigify addon, to create a basic human, then use rigify button
+    # causes some bones to be lost after leaving edit mode (bones number drops from 218 to 217).
+    # Not cause of the lost bone problem has not yet been found.
+    return True
+
+
+@diff_must_replace.register(T.VertexGroups)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property) -> bool:
     # Full replace if anything has changed is easier to cope with in ObjectProxy._update_vertex_groups()
     return (
         any((bl_item.name != proxy.data("name") for bl_item, proxy in zip(collection, sequence)))
@@ -761,43 +967,87 @@ def _diff_must_replace_vertex_groups(
     )
 
 
-@diff_must_replace.register(T.GreasePencilLayers)
-def _diff_must_replace_info_mismatch(
-    collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property
-) -> bool:
+@diff_must_replace.register(T.GreasePencilLayers)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property) -> bool:
     # Name mismatch (in info property). This may happen during layer swap and cause unsolicited rename
     # Easier to solve with full replace
     return any((bl_item.info != proxy.data("info") for bl_item, proxy in zip(collection, sequence)))
+
+
+@diff_must_replace.register(T.ActionFCurves)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], collection_property: T.Property) -> bool:
+    # The FCurve API has two caveats (seen in 2.83.9):
+    # - it is not possible to set FCurve.group from a valid group to None (but the inverse is possible)
+    # - setting group sometimes changes array_index, like in (no groups initially)
+    #       >>> a=D.actions[0]
+    #       >>> g=a.groups.new('plop')
+    #       >>> a.fcurves[1].color[0] = 0.1
+    #       >>> a.fcurves[2].color[0] = 0.2
+    #       >>> [(i.data_path, i.array_index, i.color[0]) for i in a.fcurves]
+    #       [('location', 0, 0.0), ('location', 1, 0.10000000149011612), ('location', 2, 0.20000000298023224)]
+    #       >>>
+    #       >>> a.fcurves[2].group = g
+    #       >>> [(i.data_path, i.array_index, i.color[0]) for i in a.fcurves]
+    #       [('location', 2, 0.20000000298023224), ('location', 0, 0.0), ('location', 1, 0.10000000149011612)]
+
+    # So overwrite the whole Action.fcurves array as soon as any group changes
+
+    from mixer.blender_data.misc_proxies import PtrToCollectionItemProxy
+
+    for proxy, item in zip(sequence, collection):
+        group_proxy = cast(PtrToCollectionItemProxy, proxy.data("group"))
+        if item.group is None:
+            if group_proxy:
+                # not None -> None
+                return True
+        else:
+            if not group_proxy:
+                # None -> not None
+                return True
+            same_group = group_proxy == PtrToCollectionItemProxy.make(T.FCurve, "group").load(item)
+            if not same_group:
+                return True
+
+    return False
 
 
 #
 # Clear_from
 #
 @dispatch_rna
-def clear_from(collection: T.bpy_prop_collection, sequence: List[DatablockProxy]) -> int:
+def clear_from(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], context: Context) -> int:
     """
     Returns the index of the first item in collection that has a type that does not match the
     coresponding item in sequence
+
+    This is the case for items that would require to change type (e.g. ObjectModifier) but cannot be morphed. This enables the caller
+    to truncate the collection at the first element that cannot be morphed in-place and re_write thj collection
+    from this point on.
     """
     return min(len(sequence), len(collection))
 
 
-@clear_from.register(T.ObjectModifiers)
+@clear_from.register(T.ObjectModifiers)  # type: ignore[no-redef]
 @clear_from.register(T.ObjectGpencilModifiers)
-@clear_from.register(T.SequenceModifiers)
-def _clear_from_name(collection: T.bpy_prop_collection, sequence: List[DatablockProxy]) -> int:
-    """clear_from() implementation for collections with items types are named "type" """
+@clear_from.register(T.SequenceModifiers)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], context: Context) -> int:
+    """clear_from implementation for collections of items that cannot be updated if their "type" attribute changes."""
     for i, (proxy, item) in enumerate(zip(sequence, collection)):
         if proxy.data("type") != item.type:
             return i
     return min(len(sequence), len(collection))
 
 
-@clear_from.register(T.Nodes)
-def _clear_from_bl_idname(collection: T.bpy_prop_collection, sequence: List[DatablockProxy]) -> int:
-    """clear_from() implementation for collections with items types are named "bl_idname" """
+@clear_from.register(T.Nodes)  # type: ignore[no-redef]
+def _(collection: T.bpy_prop_collection, sequence: List[DatablockProxy], context: Context) -> int:
+    """clear_from implementation for collections of items that cannot be updated if their "bl_idname" attribute
+    changes."""
     for i, (proxy, item) in enumerate(zip(sequence, collection)):
         if proxy.data("bl_idname") != item.bl_idname:
+            # On the receiver, NodeTree.nodes will be partially cleared, which will clear some links.
+            # Resending the links is the easiest way to restore them.
+            # Note that Nodes items order may change after a socket default_value is updated !
+            context.visit_state.send_nodetree_links = True
             return i
 
     return min(len(sequence), len(collection))
@@ -808,11 +1058,7 @@ def _clear_from_bl_idname(collection: T.bpy_prop_collection, sequence: List[Data
 #
 @dispatch_rna
 def truncate_collection(collection: T.bpy_prop_collection, size: int):
-    """Truncates collection to _at most_ size elements, ensuring that items can safely be saved into
-    the collection. This might clear the collection if its elements cannot be updated.
-
-    This method is useful for bpy _prop_collections that cannot be safely be overwritten in place,
-    because the items cannot be morphed."""
+    """Truncates collection to size elements by removing elements at the end."""
     return
 
 
@@ -824,11 +1070,6 @@ def _truncate_collection_remove(collection: T.bpy_prop_collection, size: int):
     except Exception as e:
         logger.error(f"truncate_collection {collection}: exception ...")
         logger.error(f"... {e!r}")
-
-
-@truncate_collection.register(T.Nodes)
-def _truncate_collection_clear(collection: T.bpy_prop_collection, size: int):
-    collection.clear()
 
 
 @truncate_collection.register(T.IDMaterials)
@@ -846,5 +1087,8 @@ def remove_datablock(collection: T.bpy_prop_collection, datablock: T.ID):
     elif isinstance(datablock, T.Key):
         # the doc labels it unsafe, use sparingly
         bpy.data.batch_remove([datablock])
+    elif isinstance(datablock, T.Library):
+        # TODO 2.91 has BlendDatalibraries.remove()
+        logger.warning(f"remove_datablock({datablock}): ignored (library)")
     else:
         collection.remove(datablock)

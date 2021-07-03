@@ -28,20 +28,20 @@ import bpy
 import bpy.types as T  # noqa
 
 from mixer.blender_data.datablock_proxy import DatablockProxy
+from mixer.blender_data.json_codec import serialize
 from mixer.blender_data.mesh_proxy import VertexGroups
 from mixer.blender_data.proxy import Delta, DeltaReplace
 from mixer.blender_data.struct_collection_proxy import StructCollectionProxy
+from mixer.blender_data.armature_proxy import ArmatureProxy
 
 if TYPE_CHECKING:
-    from mixer.blender_data.bpy_data_proxy import Context, Proxy
+    from mixer.blender_data.bpy_data_proxy import Context
     from mixer.blender_data.struct_proxy import StructProxy
 
 
 DEBUG = True
 
 logger = logging.getLogger(__name__)
-
-_vertex_group_prop = T.Object.bl_rna.properties["vertex_groups"].fixed_type
 
 
 def _window_area():
@@ -52,6 +52,7 @@ def _window_area():
     return None, None
 
 
+@serialize
 class ObjectProxy(DatablockProxy):
     """
     Proxy for a Object datablock. This specialization is required to handle properties with that are accessible
@@ -61,9 +62,20 @@ class ObjectProxy(DatablockProxy):
     def _save(self, datablock: T.Object, context: Context) -> T.Object:
         # TODO remove extra work done here. The vertex groups array is created in super()._save(), then cleared in
         # _update_vertex_groups(), because diff() requires clear().
+
+        # Object.pose.bones can be saved only after Armature.bones.
+        if isinstance(datablock.data, T.Armature):
+            ArmatureProxy.update_edit_bones(datablock, context)
+
         self._fit_material_slots(datablock, self._data["material_slots"], context)
+
+        # TODO pose_bone probably needs to be in POSE mode. In Object mode, the following error is triggered on
+        # rigify's basic human rig :
+        # on attribute: bpy.data.objects['rig'].pose.bones.201.constraints.0.target_space, value: POSE
+        # TypeError('bpy_struct: item.attr = val: enum "POSE" not found in (\'WORLD\', \'CUSTOM\', \'LOCAL\')')
         super()._save(datablock, context)
         self._update_vertex_groups(datablock, self._data["vertex_groups"], context)
+
         return datablock
 
     def _fit_material_slots(
@@ -121,7 +133,7 @@ class ObjectProxy(DatablockProxy):
             return
 
         try:
-            mesh_proxy = context.proxy_state.proxies.get(datablock_ref_proxy.mixer_uuid)
+            mesh_proxy = context.proxy_state.proxies[datablock_ref_proxy.mixer_uuid]
         except KeyError:
             logger.error(
                 f"_save(): internal error: {object_datablock} has vertex groups, but its data datablock has None"
@@ -155,7 +167,7 @@ class ObjectProxy(DatablockProxy):
         vertex_groups.clear()
         groups_data = []
         for i in range(vertex_groups_proxy.length):
-            item = vertex_groups_proxy.data(i)
+            item = vertex_groups_proxy[i]
             groups_data.append((item.data("index"), item.data("lock_weight"), item.data("name")))
 
         for index, lock_weight, name in groups_data:
@@ -170,7 +182,9 @@ class ObjectProxy(DatablockProxy):
             for index, weight in zip(indices, weights):
                 vertex_group.add([index], weight, "ADD")
 
-    def _diff(self, struct: T.Object, key: str, prop: T.Property, context: Context, diff: Proxy) -> Optional[Delta]:
+    def _diff(
+        self, struct: T.Object, key: str, prop: T.Property, context: Context, diff: StructProxy
+    ) -> Optional[Delta]:
         from mixer.blender_data.attributes import diff_attribute
 
         must_replace = False
@@ -200,7 +214,7 @@ class ObjectProxy(DatablockProxy):
 
     def apply(
         self,
-        attribute: T.Object,
+        datablock: T.Object,
         parent: T.BlendDataObjects,
         key: Union[int, str],
         delta: Delta,
@@ -222,12 +236,28 @@ class ObjectProxy(DatablockProxy):
         update = delta.value
 
         if to_blender:
-            incoming_material_slots = update.data("material_slots")
-            self._fit_material_slots(attribute, incoming_material_slots, context)
+            if isinstance(datablock.data, T.Armature):
+                # TODO replace with update.data(("pose", "bones"))
+                # or update["pose"]["bones"]
+                pose = update.data("pose")
+                if pose:
+                    if isinstance(pose, Delta):
+                        bones = pose.value.data("bones")
+                    else:
+                        # delta may be a full Object replace, thus pose is a StructProxy
+                        bones = pose.data("bones")
+                    if bones:
+                        # Update Armature.edit_bones before Object.pose.bones
+                        ArmatureProxy.update_edit_bones(datablock, context)
 
-        updated_proxy = super().apply(attribute, parent, key, delta, context, to_blender)
+            incoming_material_slots = update.data("material_slots")
+            self._fit_material_slots(datablock, incoming_material_slots, context)
+
+        updated_proxy = super().apply(datablock, parent, key, delta, context, to_blender)
+        assert isinstance(updated_proxy, ObjectProxy)
 
         if to_blender:
             incoming_vertex_groups = update.data("vertex_groups")
-            updated_proxy._update_vertex_groups(attribute, incoming_vertex_groups, context)
+            updated_proxy._update_vertex_groups(datablock, incoming_vertex_groups, context)
+
         return updated_proxy

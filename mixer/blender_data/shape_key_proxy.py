@@ -29,6 +29,7 @@ import bpy.types as T  # noqa
 
 from mixer.blender_data import specifics
 from mixer.blender_data.datablock_proxy import DatablockProxy
+from mixer.blender_data.json_codec import serialize
 from mixer.blender_data.proxy import Delta, DeltaReplace
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ DEBUG = True
 logger = logging.getLogger(__name__)
 
 
+@serialize
 class ShapeKeyProxy(DatablockProxy):
     """
     Proxy for a ShapeKey datablock.
@@ -50,62 +52,35 @@ class ShapeKeyProxy(DatablockProxy):
 
     def create_shape_key_datablock(self, data_proxy: DatablockProxy, context: Context) -> T.Key:
         # find any Object using the datablock manages by this Proxy
-        datablocks = context.proxy_state.datablocks
         data_uuid = data_proxy.mixer_uuid
         objects = context.proxy_state.objects[data_uuid]
         if not objects:
-            logger.error(f"update_shape_key_datablock: received an update for {datablocks[self.mixer_uuid]}...")
-            logger.error(f"... user {datablocks[data_uuid]} not linked to an object. Update skipped")
+            logger.error(
+                f"update_shape_key_datablock: received an update for {context.proxy_state.datablock(self.mixer_uuid)}..."
+            )
+            logger.error(f"... user {context.proxy_state.datablock(data_uuid)} not linked to an object. Update skipped")
             return None
         object_uuid = next(iter(objects))
-        object_datablock = datablocks[object_uuid]
+        object_datablock = context.proxy_state.datablock(object_uuid)
+        assert object_datablock  # make mypy happy. TODO ProxyState.datablock() should raise ?
 
         # update the Key datablock using the Object API
-        key_blocks_proxy = self.data("key_blocks")
-        object_datablock.shape_key_clear()  # removes the Key datablock
+        key_blocks_proxy = self._data["key_blocks"]
+        shape_key_uuid = self.mixer_uuid
+        if object_datablock.data.shape_keys:
+            object_datablock.shape_key_clear()  # removes the Key datablock
+            context.proxy_state.remove_datablock(shape_key_uuid)
+
         for _ in range(len(key_blocks_proxy)):
             object_datablock.shape_key_add()
 
         new_shape_key_datablock = object_datablock.data.shape_keys
         self.save(new_shape_key_datablock, bpy.data.shape_keys, new_shape_key_datablock.name, context)
 
-        shape_key_uuid = self.mixer_uuid
         new_shape_key_datablock.mixer_uuid = shape_key_uuid
-        context.proxy_state.datablocks[shape_key_uuid] = new_shape_key_datablock
+        context.proxy_state.add_datablock(shape_key_uuid, new_shape_key_datablock)
 
         return new_shape_key_datablock
-
-    def load(
-        self,
-        datablock: T.ID,
-        context: Context,
-        bpy_data_collection_name: str = None,
-    ) -> DatablockProxy:
-        super().load(datablock, context, bpy_data_collection_name)
-
-        # ShapeKey.relative_key is a reference into Key.key_blocks. The default synchronization would
-        # load save its whole contents for each reference.
-        # So relative_key is skipped in the default synchronization, and the Blender reference is translated
-        # into a reference by name in Key.key_blocks.
-        # diff_must_replace() forces full replacement if any relative_key changes
-        key_blocks = datablock.key_blocks
-        for key_block_proxy in self._data["key_blocks"]:
-            key_block_name = key_block_proxy._data["name"]
-            key_block_proxy._data["relative_key"] = key_blocks.get(key_block_name).relative_key.name
-
-        return self
-
-    def save(self, datablock: T.ID, unused_parent: T.bpy_struct, unused_key: Union[int, str], context: Context) -> T.ID:
-        super().save(datablock, unused_parent, unused_key, context)
-
-        # see load()
-        key_blocks = datablock.key_blocks
-        for key_block_proxy in self._data["key_blocks"]:
-            key_block_name = key_block_proxy._data["name"]
-            relative_key_name = key_block_proxy._data["relative_key"]
-            key_blocks[key_block_name].relative_key = key_blocks[relative_key_name]
-
-        return datablock
 
     def apply(
         self,

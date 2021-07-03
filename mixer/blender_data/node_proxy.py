@@ -20,11 +20,11 @@ Proxies for bpy.types.NodeTree and bpy.types.NodeLinks
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, TYPE_CHECKING, Union
+from typing import List, Optional, Tuple, TYPE_CHECKING, Union
 import bpy.types as T  # noqa
 
-from mixer.blender_data.proxy import Delta, DeltaUpdate
-from mixer.blender_data.struct_collection_proxy import StructCollectionProxy
+from mixer.blender_data.json_codec import serialize
+from mixer.blender_data.proxy import Delta, DeltaUpdate, Proxy
 
 if TYPE_CHECKING:
     from mixer.blender_data.proxy import Context
@@ -32,57 +32,77 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NodeLinksProxy(StructCollectionProxy):
+def _find_socket(sockets: Union[T.NodeInputs, T.NodeOutputs], identifier: str) -> int:
+    for i, socket in enumerate(sockets):
+        if socket.identifier == identifier:
+            return i
+    return -1
+
+
+@serialize
+class NodeLinksProxy(Proxy):
     """Proxy for bpy.types.NodeLinks"""
 
-    def _load(self, links: T.NodeLinks) -> List[Dict[str, str]]:
-        seq = []
-        for link in links:
-            item = {}
-            # NodeLink contain pointers to Node and NodeSocket.
-            # Just keep the names to restore the links in ShaderNodeTreeProxy.save
-            item["from_node"] = link.from_node.name
-            item["from_socket"] = link.from_socket.name
-            item["to_node"] = link.to_node.name
-            item["to_socket"] = link.to_socket.name
-            seq.append(item)
-        return seq
+    # TODO should not be a StructCollectionProxy since all updates are now replaces
+    _serialize = ("_sequence",)
 
-    def load(self, links: T.NodeLinks, key: str, _, context: Context) -> NodeLinksProxy:
+    def __init__(self):
+        self._sequence: List[Tuple[str, int, str, int]] = []
+
+    def _load(self, links: T.NodeLinks) -> List[Tuple[str, int, str, int]]:
+        # NodeLink contain pointers to Node and NodeSocket.
+        # Just keep the names to restore the links in ShaderNodeTreeProxy.save
+        # Nodes names are unique in a node_tree.
+        # Node socket names are *not* unique in a node_tree, so use index in array
+        return [
+            (
+                link.from_node.name,
+                _find_socket(link.from_node.outputs, link.from_socket.identifier),
+                link.to_node.name,
+                _find_socket(link.to_node.inputs, link.to_socket.identifier),
+            )
+            for link in links
+        ]
+
+    def load(self, links: T.NodeLinks, unused_context: Context) -> NodeLinksProxy:
         self._sequence = self._load(links)
         return self
 
-    def save(self, unused_attribute, node_tree: T.NodeTree, unused_key: str, context: Context):
+    def save(self, unused_attribute, node_tree: T.NodeTree, unused_key, context: Context):
         """Saves this proxy into node_tree.links"""
         if not isinstance(node_tree, T.NodeTree):
-            logger.error(f"NodeLinksProxy.save() called with {node_tree}. Expected a bpy.types.NodeTree")
+            logger.error(f"save(): attribute {context.visit_state.display_path()} ...")
+            logger.error(f"... has type {type(node_tree)}")
+            logger.error("... expected a bpy.types.NodeTree")
             return
 
         node_tree.links.clear()
-        for link_proxy in self._sequence:
-            from_node_name = link_proxy["from_node"]
-            from_socket_name = link_proxy["from_socket"]
-            to_node_name = link_proxy["to_node"]
-            to_socket_name = link_proxy["to_socket"]
+        for from_node_name, from_socket_index, to_node_name, to_socket_index in self._sequence:
 
             from_node = node_tree.nodes.get(from_node_name)
             if from_node is None:
-                logger.error(f"save(): from_node {node_tree}.nodes[{from_node_name}] is None")
+                logger.error(
+                    f"save(): from_node is None for {context.visit_state.display_path()}.nodes[{from_node_name}]"
+                )
                 return
 
-            from_socket = from_node.outputs.get(from_socket_name)
+            from_socket = from_node.outputs[from_socket_index]
             if from_socket is None:
-                logger.error(f"save(): from_socket {node_tree}.nodes[{from_socket_name}] is None")
+                logger.error(
+                    f"save(): from_socket is None for {context.visit_state.display_path()}.nodes[{from_node_name}].outputs[{from_socket_index}]"
+                )
                 return
 
             to_node = node_tree.nodes.get(to_node_name)
             if to_node is None:
-                logger.error(f"save(): to_node {node_tree}.nodes[{to_node_name}] is None")
+                logger.error(f"save(): to_node is None for {context.visit_state.display_path()}.nodes[{to_node_name}]")
                 return
 
-            to_socket = to_node.inputs.get(to_socket_name)
+            to_socket = to_node.inputs[to_socket_index]
             if to_socket is None:
-                logger.error(f"save(): to_socket {node_tree}.nodes[{to_socket_name}] is None")
+                logger.error(
+                    f"save(): to_socket is None for {context.visit_state.display_path()}.nodes[{to_node_name}].inputs[{to_socket_index}]"
+                )
                 return
 
             node_tree.links.new(from_socket, to_socket)
@@ -120,11 +140,11 @@ class NodeLinksProxy(StructCollectionProxy):
 
     def diff(self, links: T.NodeLinks, key, prop, context: Context) -> Optional[DeltaUpdate]:
         # always complete updates
-        blender_links = self._load(links)
-        if blender_links == self._sequence:
+        links = self._load(links)
+        if links == self._sequence and not context.visit_state.send_nodetree_links:
             return None
 
         diff = self.__class__()
         diff.init(None)
-        diff._sequence = blender_links
+        diff._sequence = links
         return DeltaUpdate(diff)

@@ -23,25 +23,27 @@ See synchronization.md
 """
 from __future__ import annotations
 
+from collections import defaultdict
 import logging
-from typing import List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, TypeVar, Union
 
 import bpy.types as T  # noqa
 
 from mixer.blender_data import specifics
 from mixer.blender_data.attributes import apply_attribute, diff_attribute, read_attribute, write_attribute
-from mixer.blender_data.proxy import Delta, DeltaAddition, DeltaReplace, DeltaUpdate
-from mixer.blender_data.proxy import Proxy
+from mixer.blender_data.json_codec import serialize
+from mixer.blender_data.proxy import AddElementFailed, Delta, DeltaAddition, DeltaReplace, DeltaUpdate, Proxy
 from mixer.blender_data.struct_proxy import StructProxy
 
 if TYPE_CHECKING:
-    from mixer.blender_data.datablock_proxy import DatablockProxy
+    from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
+    from mixer.blender_data.misc_proxies import NonePtrProxy
     from mixer.blender_data.proxy import Context
 
 logger = logging.getLogger(__name__)
 
 
-def _proxy_factory(attr):
+def _proxy_factory(attr) -> Union[DatablockRefProxy, NonePtrProxy, StructProxy]:
     if isinstance(attr, T.ID) and not attr.is_embedded_data:
         from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
 
@@ -51,9 +53,43 @@ def _proxy_factory(attr):
 
         return NonePtrProxy()
     else:
-        return StructProxy()
+        return StructProxy.make(attr)
 
 
+T_ = TypeVar("T_")
+
+
+class Resolver:
+    """Helper to defer item reference resolution after the referenced item creation.
+
+    An array element may reference an item with a larger index. As the arrays are created depth wise, the item
+    with the larger index does not exist when the item with the smaller item stored a reference. This situation
+    occurs when bone parenting is reversed.
+
+    TODO use this class for DatablockRefCollectionProxy as well
+    """
+
+    def __init__(self):
+        self._items: Dict[T_, List[Callable[[], None]]] = defaultdict(list)
+
+    def __bool__(self):
+        return bool(self._items)
+
+    def append(self, key: T_, func: Callable[[], None]):
+        """Add func() to be called by resolve() for item at key"""
+        self._items[key].append(func)
+
+    def resolve(self, key: T_):
+        """Resolve the references to item identified by key by calling the closures registered for it."""
+        try:
+            funcs = self._items.pop(key)
+        except IndexError:
+            return
+        for f in funcs:
+            f()
+
+
+@serialize
 class StructCollectionProxy(Proxy):
     """
     Proxy to a bpy_prop_collection of non-datablock Struct.
@@ -65,12 +101,11 @@ class StructCollectionProxy(Proxy):
     _serialize = ("_sequence", "_diff_additions", "_diff_deletions", "_diff_updates")
 
     def __init__(self):
-        # TODO remove _data, just here to make JsonCodec happy
-        self._data = {}
-        self._diff_updates: List[Tuple[int, DeltaUpdate]] = []
+        self._diff_updates: List[Tuple[int, Delta]] = []
         self._diff_deletions: int = 0
         self._diff_additions: List[DeltaAddition] = []
-        self._sequence: List[DatablockProxy] = []
+        self._sequence: List[Proxy] = []
+        self._resolver: Optional[Resolver] = None
 
     @classmethod
     def make(cls, attr_property: T.Property):
@@ -86,11 +121,19 @@ class StructCollectionProxy(Proxy):
     def __iter__(self):
         return iter(self._sequence)
 
+    def __getitem__(self, i: int):
+        return self._sequence[i]
+
     @property
     def length(self) -> int:
         return len(self._sequence)
 
-    def data(self, key: int, resolve_delta=True) -> Optional[Union[DeltaUpdate, DeltaAddition, DatablockProxy]]:
+    def register_unresolved(self, i: int, func: Callable[[], None]):
+        if self._resolver is None:
+            self._resolver = Resolver()
+        self._resolver.append(i, func)
+
+    def data(self, key: int, resolve_delta=True) -> Optional[Union[Delta, Proxy]]:
         """Return the data at key, which may be a struct member, a dict value or an array value,
 
         Args:
@@ -119,16 +162,18 @@ class StructCollectionProxy(Proxy):
     def load(
         self,
         bl_collection: T.bpy_prop_collection,
-        key: Union[int, str],
-        bl_collection_property: T.Property,
         context: Context,
     ):
-
-        context.visit_state.path.append(key)
-        try:
-            self._sequence = [_proxy_factory(v).load(v, i, context) for i, v in enumerate(bl_collection.values())]
-        finally:
-            context.visit_state.path.pop()
+        self._sequence.clear()
+        for i, v in enumerate(bl_collection.values()):
+            context.visit_state.push(v, i)
+            try:
+                self._sequence.append(_proxy_factory(v).load(v, context))
+            except Exception as e:
+                logger.error(f"Exception during load at {context.visit_state.display_path()} ...")
+                logger.error(f"... {e!r}")
+            finally:
+                context.visit_state.pop()
         return self
 
     def save(self, collection: T.bpy_prop_collection, parent: T.bpy_struct, key: str, context: Context):
@@ -141,17 +186,30 @@ class StructCollectionProxy(Proxy):
             key: the name of the collection in parent (e.g "background_images")
             context: the proxy and visit state
         """
-        context.visit_state.path.append(key)
-        try:
-            sequence = self._sequence
-            specifics.truncate_collection(collection, len(self._sequence))
-            for i in range(len(collection), len(sequence)):
-                item_proxy = sequence[i]
-                specifics.add_element(collection, item_proxy, context)
-            for i, v in enumerate(sequence):
-                write_attribute(collection, i, v, context)
-        finally:
-            context.visit_state.path.pop()
+        sequence = self._sequence
+
+        # Using clear_from ensures that sequence data is compatible with remaining elements after
+        # truncate_collection. This addresses an issue with Nodes, for which the order of default nodes (material
+        # output and principled in collection) may not match the order of incoming nodes. Saving node data into a
+        # node of the wrong type can lead to a crash.
+        clear_from = specifics.clear_from(collection, sequence, context)
+        specifics.truncate_collection(collection, clear_from)
+
+        # For collections like `IDMaterials`, the creation API (`.new(datablock_ref)`) also writes the value.
+        # For collections like `Nodes`, the creation API (`.new(name)`) does not write the item value.
+        # So the value must always be written for all collection types.
+        collection_length = len(collection)
+        for i, item_proxy in enumerate(sequence[:collection_length]):
+            write_attribute(collection, i, item_proxy, context)
+        for i, item_proxy in enumerate(sequence[collection_length:], collection_length):
+            try:
+                specifics.add_element(collection, item_proxy, i, context)
+                if self._resolver:
+                    self._resolver.resolve(i)
+            except AddElementFailed:
+                break
+            # Must write at once, otherwise the default item name might conflit with a later item name
+            write_attribute(collection, i, item_proxy, context)
 
     def apply(
         self,
@@ -179,14 +237,13 @@ class StructCollectionProxy(Proxy):
         assert type(update) == type(self)
 
         if isinstance(delta, DeltaReplace):
+            # The collection must be replaced as a whole
             self._sequence = update._sequence
             if to_blender:
                 specifics.truncate_collection(collection, 0)
                 self.save(collection, parent, key, context)
         else:
             # a sparse update
-
-            context.visit_state.path.append(key)
             try:
                 sequence = self._sequence
 
@@ -210,18 +267,19 @@ class StructCollectionProxy(Proxy):
                 for i, delta_addition in enumerate(update._diff_additions, len(sequence)):
                     if to_blender:
                         item_proxy = delta_addition.value
-                        specifics.add_element(collection, item_proxy, context)
+                        try:
+                            specifics.add_element(collection, item_proxy, i, context)
+                            if self._resolver:
+                                self._resolver.resolve(i)
+                        except AddElementFailed:
+                            break
                         write_attribute(collection, i, item_proxy, context)
                     sequence.append(delta_addition.value)
 
             except Exception as e:
-                logger.warning(f"StructCollectionProxy.apply(). Processing {delta}")
-                logger.warning(f"... for {collection}")
-                logger.warning(f"... Exception: {e!r}")
-                logger.warning("... Update ignored")
-
-            finally:
-                context.visit_state.path.pop()
+                logger.warning("apply: Exception while processing attribute ...")
+                logger.warning(f"... {context.visit_state.display_path()}.{key}")
+                logger.warning(f"... {e!r}")
 
         return self
 
@@ -251,35 +309,32 @@ class StructCollectionProxy(Proxy):
             #   When swapping layers A and B in a GreasePencilLayers, renaming layer 0 into B cause an unsolicited
             #   rename of layer 0 into B.001
             # Send a replacement for the whole collection
-            self.load(collection, key, collection_property, context)
+            self.load(collection, context)
             return DeltaReplace(self)
         else:
             item_property = collection_property.fixed_type
-            context.visit_state.path.append(key)
-            try:
-                diff = self.__class__()
-                clear_from = specifics.clear_from(collection, sequence)
-                for i in range(clear_from):
-                    delta = diff_attribute(collection[i], i, item_property, sequence[i], context)
-                    if delta is not None:
-                        diff._diff_updates.append((i, delta))
+            diff = self.__class__()
 
+            # items from clear_from index cannot be updated, most often because eir type has changed (e.g
+            # ObjectModifier)
+            clear_from = specifics.clear_from(collection, sequence, context)
+
+            # run a diff for the head, that can be updated in-place
+            for i in range(clear_from):
+                delta = diff_attribute(collection[i], i, item_property, sequence[i], context)
+                if delta is not None:
+                    diff._diff_updates.append((i, delta))
+
+            if specifics.can_resize(collection, context):
+                # delete the existing tail that cannot be modified
                 diff._diff_deletions = len(sequence) - clear_from
 
+                # add the new tail
                 for i, item in enumerate(collection[clear_from:], clear_from):
-                    value = read_attribute(item, i, item_property, context)
+                    value = read_attribute(item, i, item_property, collection, context)
                     diff._diff_additions.append(DeltaAddition(value))
-            finally:
-                context.visit_state.path.pop()
 
             if diff._diff_updates or diff._diff_deletions or diff._diff_additions:
                 return DeltaUpdate(diff)
 
         return None
-
-    def find(self, path: List[Union[int, str]]) -> Proxy:
-        if not path:
-            return self
-
-        head, *tail = path
-        return self._data[head].find(tail)

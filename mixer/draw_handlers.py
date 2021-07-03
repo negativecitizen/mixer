@@ -28,9 +28,10 @@ from mixer.bl_utils import get_mixer_prefs, get_mixer_props
 from mixer.broadcaster.common import ClientAttributes
 
 import bpy
-from mathutils import Matrix, Vector
 
+from functools import lru_cache
 import logging
+from mathutils import Matrix, Vector
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,11 @@ def users_frustrum_draw():
 def users_frustum_name_draw():
     prefs = get_mixer_prefs()
 
-    if not prefs.display_names_gizmos or share_data.client.current_room is None:
+    if (
+        not prefs.display_frustums_gizmos
+        or not prefs.display_frustums_names_gizmos
+        or share_data.client.current_room is None
+    ):
         return
 
     def per_user_callback(user_dict):
@@ -243,7 +248,11 @@ def users_selection_draw():
 def users_selection_name_draw():
     prefs = get_mixer_prefs()
 
-    if not prefs.display_names_gizmos or share_data.client.current_room is None:
+    if (
+        not prefs.display_selections_gizmos
+        or not prefs.display_selections_names_gizmos
+        or share_data.client.current_room is None
+    ):
         return
 
     def per_user_callback(user_dict):
@@ -254,10 +263,14 @@ def users_selection_name_draw():
         bbox_corner = matrix @ Vector(local_bbox[1])
         draw_user_name(user_dict, bbox_corner)
 
-    users_selection_draw_iteration(per_user_callback, per_object_callback)
+    users_selection_draw_iteration(
+        per_user_callback, per_object_callback, collection_detail=False, draw_first_only=True
+    )
 
 
-def users_selection_draw_iteration(per_user_callback, per_object_callback):
+def users_selection_draw_iteration(
+    per_user_callback, per_object_callback, collection_detail=True, draw_first_only=False
+):
     if share_data.client is None:
         return
 
@@ -278,37 +291,40 @@ def users_selection_draw_iteration(per_user_callback, per_object_callback):
         if not per_user_callback(user_dict):
             continue
 
-        for scene_name, scene_dict in scenes.items():
-            if scene_name != bpy.context.scene.name_full:
-                continue
+        scene_dict = scenes.get(bpy.context.scene.name_full)
+        if scene_dict is None:
+            return
 
-            selected_objects = scene_dict.get(ClientAttributes.USERSCENES_SELECTED_OBJECTS, None)
-            if selected_objects is None:
-                continue
+        selected_names = scene_dict.get(ClientAttributes.USERSCENES_SELECTED_OBJECTS, None)
+        if selected_names is None:
+            return
 
-            for object_full_name in selected_objects:
-                if object_full_name not in bpy.data.objects:
-                    logger.info(f"{object_full_name} not in bpy.data")
-                    continue
+        selected_objects = (obj for obj in bpy.data.objects if obj.name_full in set(selected_names))
+        for obj in selected_objects:
+            objects = [obj]
+            parent_matrix = IDENTITY_MATRIX
 
-                obj = bpy.data.objects[object_full_name]
-                objects = [obj]
-                parent_matrix = IDENTITY_MATRIX
+            if obj.type == "EMPTY" and obj.instance_collection is not None:
+                collection = obj.instance_collection
+                if collection_detail:
+                    objects = collection.objects
+                else:
+                    objects = []
+                parent_matrix = Matrix.Translation(-collection.instance_offset) @ obj.matrix_world
+                per_object_callback(user_dict, obj, parent_matrix @ _bbox_scale_matrix(), DEFAULT_BBOX)
+                if draw_first_only:
+                    return
 
-                if obj.type == "EMPTY" and obj.instance_collection is not None:
-                    objects = obj.instance_collection.objects
-                    parent_matrix = obj.matrix_world
+            for obj in objects:
+                bbox = obj.bound_box
 
-                    per_object_callback(user_dict, obj, obj.matrix_world @ BBOX_SCALE_MATRIX, DEFAULT_BBOX)
+                diag = Vector(bbox[2]) - Vector(bbox[4])
+                if diag.length_squared == 0:
+                    bbox = DEFAULT_BBOX
 
-                for obj in objects:
-                    bbox = obj.bound_box
-
-                    diag = Vector(bbox[2]) - Vector(bbox[4])
-                    if diag.length_squared == 0:
-                        bbox = DEFAULT_BBOX
-
-                    per_object_callback(user_dict, obj, parent_matrix @ obj.matrix_world @ BBOX_SCALE_MATRIX, bbox)
+                per_object_callback(user_dict, obj, parent_matrix @ obj.matrix_world @ _bbox_scale_matrix(), bbox)
+                if draw_first_only:
+                    return
 
 
 def draw_user_name(user_dict, coord_3d):
@@ -352,7 +368,12 @@ DEFAULT_BBOX = [
     (+1, +1, -1),
 ]
 
-BBOX_SCALE_MATRIX = Matrix.Scale(1.05, 4)
+
+@lru_cache()
+def _bbox_scale_matrix():
+    return Matrix.Scale(1.05, 4)
+
+
 IDENTITY_MATRIX = Matrix()
 
 DEFAULT_COLOR = (1, 0, 1)

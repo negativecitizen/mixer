@@ -24,15 +24,18 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Callable, Dict, List, Optional, Iterable, Tuple, TYPE_CHECKING, Union
 from uuid import uuid4
 
 import bpy
 import bpy.types as T  # noqa
 
+from mixer.blender_data.json_codec import serialize
+
 if TYPE_CHECKING:
     from mixer.blender_data.bpy_data_proxy import Context
     from mixer.blender_data.datablock_ref_proxy import DatablockRefProxy
+    from mixer.blender_data.types import Path
 
 logger = logging.getLogger(__name__)
 
@@ -59,19 +62,20 @@ class UnresolvedRefs:
     (e.g. bpy.types.Collection.children)
     """
 
-    SrcLink = Callable[[T.ID], None]
-
     def __init__(self):
-        self._refs: Dict[Uuid, List[self.Func]] = defaultdict(list)
+        self._refs: Dict[Uuid, List[Tuple[Callable[[T.ID], None], str]]] = defaultdict(list)
 
-    def append(self, dst_uuid: Uuid, src_link: SrcLink):
-        self._refs[dst_uuid].append(src_link)
+    def __bool__(self):
+        return bool(self._refs)
+
+    def append(self, dst_uuid: Uuid, src_link: Callable[[T.ID], None], display_string: str = ""):
+        self._refs[dst_uuid].append((src_link, display_string))
 
     def resolve(self, dst_uuid: Uuid, dst_datablock: T.ID):
         if dst_uuid in self._refs:
-            for src_link in self._refs[dst_uuid]:
+            for src_link, display_string in self._refs[dst_uuid]:
                 src_link(dst_datablock)
-                logger.info(f"resolving reference to {dst_datablock}")
+                logger.info(f"resolving reference to {dst_datablock!r} {dst_uuid}: {display_string}")
             del self._refs[dst_uuid]
 
 
@@ -81,6 +85,7 @@ class MaxDepthExceeded(Exception):
     pass
 
 
+@serialize
 class Delta:
     """
     A Delta records the difference between the proxy state and Blender state.
@@ -93,6 +98,8 @@ class Delta:
     add, remove or update operation
     """
 
+    _serialize = ("value",)
+
     def __init__(self, value: Any):
         self.value = value
 
@@ -100,19 +107,41 @@ class Delta:
         return f"<{self.__class__.__name__}({self.value})>"
 
 
+@serialize(ctor_args=("value",))
 class DeltaAddition(Delta):
     pass
 
 
+@serialize(ctor_args=("value",))
 class DeltaDeletion(Delta):
     pass
 
 
+@serialize(ctor_args=("value",))
 class DeltaUpdate(Delta):
     pass
 
 
+@serialize(ctor_args=("value",))
 class DeltaReplace(Delta):
+    pass
+
+
+class MixerException(Exception):
+    """Base class for Mixer specific exceptions."""
+
+    pass
+
+
+class ExternalFileFailed(MixerException):
+    """Datablock creation failed because of a file related issue"""
+
+    pass
+
+
+class AddElementFailed(MixerException):
+    """Creation of an element into a bpy_prop_collection failed"""
+
     pass
 
 
@@ -142,21 +171,32 @@ class Proxy:
     def init(self, _):
         pass
 
-    def data(self, key: str, resolve_delta=True) -> Any:
-        """Return the data at key, which may be a struct member, a dict value or an array value,
+    def data(self, key_or_path: Union[int, str, Iterable[Union[int, str]]], resolve_delta=True) -> Any:
+        """Return the item identified by key_or_path in this proxy hierarchy.
 
         Args:
-            key: Integer or string to be used as index or key to the data
+            key_or_path: Integer or string or sequence of integer or string to be used as index or key to the data
             resolve_delta: If True, and the data is a Delta, will return the delta value
         """
 
-        try:
-            data = self._data[key]
-        except KeyError:
-            return None
+        if isinstance(key_or_path, (int, str)):
+            key_or_path = (key_or_path,)
 
-        if isinstance(data, Delta) and resolve_delta:
-            return data.value
+        data = self
+        for item in key_or_path:
+            try:
+                data = data[item]
+            except IndexError:
+                return None
+            except TypeError:
+                try:
+                    data = data._data[item]
+                except KeyError:
+                    return None
+
+            if isinstance(data, Delta) and resolve_delta:
+                data = data.value
+
         return data
 
     def save(
@@ -207,26 +247,23 @@ class Proxy:
         raise NotImplementedError(f"diff for {container}[{key}]")
 
     def find_by_path(
-        self, bl_item: Union[T.bpy_struct, T.bpy_prop_collection], path: List[Union[int, str]]
+        self, bl_item: Union[T.bpy_struct, T.bpy_prop_collection], path: Path
     ) -> Optional[Tuple[Union[T.bpy_struct, T.bpy_prop_collection], Proxy]]:
         head, *tail = path
         if isinstance(bl_item, T.bpy_struct):
-            bl = getattr(bl_item, head)
+            bl = getattr(bl_item, head)  # type: ignore
         elif isinstance(bl_item, T.bpy_prop_collection):
-            if isinstance(head, int) and head + 1 > len(bl_item):
-                logger.error(f"Index {head} > len({bl_item}) ({len(bl_item)})")
+            try:
+                bl = bl_item[head]
+            except (KeyError, IndexError):
                 return None
-            if isinstance(head, str) and head not in bl_item:
-                logger.error(f"Key {head} not in {bl_item}")
-                return None
-            bl = bl_item[head]
         else:
             return None
 
         proxy = self.data(head)
         if proxy is None:
             logger.warning(f"find_by_path: No proxy for {bl_item} {path}")
-            return
+            return None
 
         if not tail:
             return bl, proxy

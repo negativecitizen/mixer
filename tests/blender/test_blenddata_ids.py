@@ -96,14 +96,16 @@ area.shape = 'DISK'
     def test_morph_light(self):
         action = """
 import bpy
-bpy.ops.object.light_add(type='AREA', location=(4.0, 0.0, 0.0))
+bpy.ops.object.light_add(type='POINT', location=(4.0, 0.0, 0.0))
 """
         self.send_string(action)
         action = """
 import bpy
 D=bpy.data
-light = D.lights["Area"]
-light.type = "SUN"
+light = D.lights["Point"]
+light.type = "AREA"
+light = light.type_recast()
+light.shape = "RECTANGLE"
 """
         self.send_string(action)
         self.end_test()
@@ -159,6 +161,23 @@ scene = bpy.context.scene
 scene.name = "new_name"
 """
         self.send_string(rename)
+        self.end_test()
+
+
+class TestSceneSequencer(TestCase):
+    def test_create(self):
+        action = """
+import bpy
+scene = bpy.context.scene
+seq = scene.sequence_editor.sequences
+s0 = seq.new_effect(type='COLOR', name='color1', channel=1, frame_start=1, frame_end=10)
+s1 = seq.new_effect(type='COLOR', name='color2', channel=2, frame_start=10, frame_end=20)
+# The value read by default (0.) cannot be written. Set to a valid value
+s0.strobe = 1.0
+s1.strobe = 1.0
+"""
+        self.send_string(action)
+
         self.end_test()
 
 

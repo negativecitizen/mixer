@@ -22,13 +22,16 @@ See synchronization.md
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Optional, Tuple, TYPE_CHECKING, Union
 
 import bpy.types as T  # noqa
 
 from mixer.blender_data import specifics
 from mixer.blender_data.attributes import apply_attribute, diff_attribute, read_attribute, write_attribute
+from mixer.blender_data.json_codec import serialize
+from mixer.blender_data.misc_proxies import NonePtrProxy
 from mixer.blender_data.proxy import Delta, DeltaReplace, DeltaUpdate, Proxy
 
 if TYPE_CHECKING:
@@ -37,10 +40,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _create_clear_animation_data(incoming_proxy: StructProxy, existing_struct: T.bpy_struct) -> Optional[T.AnimData]:
+    if existing_struct.animation_data is None:
+        if not isinstance(incoming_proxy, NonePtrProxy):
+            # None (current blender value) -> not None (incoming proxy)
+            existing_struct.animation_data_create()
+    else:
+        if isinstance(incoming_proxy, NonePtrProxy):
+            # not None (current blender value) -> None (incoming proxy)
+            existing_struct.animation_data_clear()
+    return existing_struct.animation_data
+
+
+@lru_cache()
+def _proxy_types():
+    from mixer.blender_data.modifier_proxies import NodesModifierProxy
+
+    proxy_types = {}
+
+    try:
+        proxy_types[T.NodesModifier] = NodesModifierProxy
+    except AttributeError:
+        pass
+
+    return proxy_types
+
+
+@serialize
 class StructProxy(Proxy):
     """
     Holds a copy of a Blender bpy_struct
     """
+
+    _serialize: Tuple[str, ...] = ("_data",)
 
     def __init__(self):
         self._data = {}
@@ -52,7 +84,12 @@ class StructProxy(Proxy):
     def clear_data(self):
         self._data.clear()
 
-    def load(self, attribute: T.bpy_struct, key: Union[int, str], context: Context) -> StructProxy:
+    @classmethod
+    def make(cls, bpy_struct: T.bpy_struct) -> StructProxy:
+        proxy_class = _proxy_types().get(type(bpy_struct), StructProxy)
+        return proxy_class()
+
+    def load(self, attribute: T.bpy_struct, context: Context) -> StructProxy:
         """
         Load the attribute Blender struct into this proxy
 
@@ -66,14 +103,10 @@ class StructProxy(Proxy):
         # includes properties from the bl_rna only, not the "view like" properties like MeshPolygon.edge_keys
         # that we do not want to load anyway
         properties = specifics.conditional_properties(attribute, properties)
-        context.visit_state.path.append(key)
-        try:
-            for name, bl_rna_property in properties:
-                attr = getattr(attribute, name)
-                attr_value = read_attribute(attr, name, bl_rna_property, context)
-                self._data[name] = attr_value
-        finally:
-            context.visit_state.path.pop()
+        for name, bl_rna_property in properties:
+            attr = getattr(attribute, name)
+            attr_value = read_attribute(attr, name, bl_rna_property, attribute, context)
+            self._data[name] = attr_value
 
         return self
 
@@ -93,24 +126,15 @@ class StructProxy(Proxy):
             key: (e.g. "display)
             context: the proxy and visit state
         """
-        if attribute is None:
-            if isinstance(parent, T.bpy_prop_collection):
-                logger.warning(f"Cannot write to '{parent}', attribute '{key}' because it does not exist.")
-            else:
-                # Don't log this because it produces too many log messages when participants have plugins
-                # f"Note: May be due to a plugin used by the sender and not on this Blender"
-                # f"Note: May be due to unimplemented 'use_{key}' implementation for type {type(bl_instance)}"
-                # f"Note: May be {bl_instance}.{key} should not have been saved"
-                pass
+        if key == "animation_data" and (attribute is None or isinstance(attribute, T.AnimData)):
+            attribute = _create_clear_animation_data(self, parent)
 
+        if attribute is None:
+            logger.info(f"save: attribute is None for {context.visit_state.display_path()}.{key}")
             return
 
-        context.visit_state.path.append(key)
-        try:
-            for k, v in self._data.items():
-                write_attribute(attribute, k, v, context)
-        finally:
-            context.visit_state.path.pop()
+        for k, v in self._data.items():
+            write_attribute(attribute, k, v, context)
 
     def apply(
         self,
@@ -120,7 +144,7 @@ class StructProxy(Proxy):
         delta: Delta,
         context: Context,
         to_blender: bool = True,
-    ) -> StructProxy:
+    ) -> Union[StructProxy, NonePtrProxy]:
         """
         Apply delta to this proxy and optionally to the Blender attribute its manages.
 
@@ -137,15 +161,24 @@ class StructProxy(Proxy):
         update = delta.value
 
         if isinstance(delta, DeltaReplace):
+            # The structure is replaced as a whole.
+            # TODO explain when this occurs
             self.copy_data(update)
             if to_blender:
                 self.save(attribute, parent, key, context)
         else:
-
-            assert type(update) == type(self)
-
-            context.visit_state.path.append(key)
-            try:
+            # the structure is updated
+            if key == "animation_data" and (attribute is None or isinstance(attribute, T.AnimData)):
+                # if animation_data is updated to None (cleared), the parent structure is updated to store
+                # a NonePtrProxy
+                if to_blender:
+                    attribute = _create_clear_animation_data(update, parent)
+                    if attribute is None:
+                        return NonePtrProxy()
+                else:
+                    if isinstance(update, NonePtrProxy):
+                        return NonePtrProxy()
+            if attribute:
                 for k, member_delta in update._data.items():
                     current_value = self._data.get(k)
                     try:
@@ -156,8 +189,6 @@ class StructProxy(Proxy):
                         logger.warning(f"... Exception: {e!r}")
                         logger.warning("... Update ignored")
                         continue
-            finally:
-                context.visit_state.path.pop()
 
         return self
 
@@ -205,35 +236,29 @@ class StructProxy(Proxy):
         Returns:
             a delta if any difference is found, None otherwise
         """
+        if attribute is None:
+            from mixer.blender_data.misc_proxies import NonePtrProxy
+
+            return DeltaUpdate(NonePtrProxy())
+
         # PERF accessing the properties from the synchronized_properties is **far** cheaper that iterating over
         # _data and the getting the properties with
         #   member_property = struct.bl_rna.properties[k]
         # line to which py-spy attributes 20% of the total diff !
-        if prop is not None:
-            context.visit_state.path.append(key)
-        try:
-            properties = context.synchronized_properties.properties(attribute)
-            properties = specifics.conditional_properties(attribute, properties)
-            for k, member_property in properties:
-                # TODO in test_differential.StructDatablockRef.test_remove
-                # target et a scene, k is world and v (current world value) is None
-                # so diff fails. v should be a BpyIDRefNoneProxy
+        properties = context.synchronized_properties.properties(attribute)
+        properties = specifics.conditional_properties(attribute, properties)
+        for k, member_property in properties:
+            try:
+                member = getattr(attribute, k)
+            except AttributeError:
+                logger.info(f"diff: unknown attribute {k} in {attribute}")
+                continue
 
-                # make a difference between None value and no member
-                try:
-                    member = getattr(attribute, k)
-                except AttributeError:
-                    logger.info(f"diff: unknown attribute {k} in {attribute}")
-                    continue
+            proxy_data = self._data.get(k)
+            delta = diff_attribute(member, k, member_property, proxy_data, context)
 
-                proxy_data = self._data.get(k)
-                delta = diff_attribute(member, k, member_property, proxy_data, context)
-
-                if delta is not None:
-                    diff._data[k] = delta
-        finally:
-            if prop is not None:
-                context.visit_state.path.pop()
+            if delta is not None:
+                diff._data[k] = delta
 
         # TODO detect media updates (reload(), and attach a media descriptor to diff)
         # difficult ?

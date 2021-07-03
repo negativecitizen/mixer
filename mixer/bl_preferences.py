@@ -47,6 +47,10 @@ def set_log_level(self, value):
     logger.log(value, "Logging level changed")
 
 
+class SharedFolderItem(bpy.types.PropertyGroup):
+    shared_folder: bpy.props.StringProperty(default="", subtype="DIR_PATH", name="Shared Folder")
+
+
 class MixerPreferences(bpy.types.AddonPreferences):
     """
     Preferences class, store persistent properties and options.
@@ -84,14 +88,53 @@ class MixerPreferences(bpy.types.AddonPreferences):
         update=update_panels_category,
     )
 
-    host: bpy.props.StringProperty(name="Host", default=os.environ.get("VRTIST_HOST", common.DEFAULT_HOST))
-    port: bpy.props.IntProperty(name="Port", default=int(os.environ.get("VRTIST_PORT", common.DEFAULT_PORT)))
-    room: bpy.props.StringProperty(name="Room", default=os.environ.get("VRTIST_ROOM", getuser()))
+    display_mixer_vrtist_panels: bpy.props.EnumProperty(
+        name="Display Mixer and VRtist Panels",
+        description="Control which panel is displayed between Mixer and VRtist",
+        items=[
+            ("MIXER", "Mixer", ""),
+            ("VRTIST", "VRtit", ""),
+            ("MIXER_AND_VRTIST", "Mixer And VRtist", ""),
+        ],
+        default="MIXER",
+    )
+
+    host: bpy.props.StringProperty(
+        name="Host", description="Server Host Name", default=os.environ.get("VRTIST_HOST", common.DEFAULT_HOST)
+    )
+    port: bpy.props.IntProperty(
+        name="Port",
+        description="Port to use to connect the server host",
+        default=int(os.environ.get("VRTIST_PORT", common.DEFAULT_PORT)),
+    )
+    room: bpy.props.StringProperty(
+        name="Room", description="Name of the session room", default="RM_" + os.environ.get("VRTIST_ROOM", getuser())
+    )
 
     # User name as displayed in peers user list
-    user: bpy.props.StringProperty(name="User", default=getuser(), update=on_user_changed)
+    user: bpy.props.StringProperty(
+        name="User Name",
+        description="Name by which the other users will identify you during\na cooperative session",
+        default=getuser(),
+        update=on_user_changed,
+    )
     color: bpy.props.FloatVectorProperty(
-        name="Color", subtype="COLOR", default=gen_random_color(), update=on_user_color_changed
+        name="User Color",
+        subtype="COLOR",
+        size=3,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        description="Color used in the viewport of the cooperative session\nto differenciate you from the other users",
+        default=gen_random_color(),
+        update=on_user_color_changed,
+    )
+
+    display_selected_room_properties: bpy.props.BoolProperty(
+        name="Room Properties", description="Display the properties of the selected room", default=False
+    )
+    users_list_panel_opened: bpy.props.BoolProperty(
+        name="Users List", description="Display the list of the users in the selected room", default=True
     )
 
     def get_log_level(self):
@@ -114,31 +157,39 @@ class MixerPreferences(bpy.types.AddonPreferences):
         name="VRtist Protocol", default=os.environ.get("MIXER_VRTIST_PROTOCOL") == "0"
     )
 
+    ignore_version_check: bpy.props.BoolProperty(default=False, name="Ignore Room Version Check")
+
     show_server_console: bpy.props.BoolProperty(name="Show Server Console", default=False)
 
     VRtist: bpy.props.StringProperty(
         name="VRtist", default=os.environ.get("VRTIST_EXE", "D:/unity/VRtist/Build/VRtist.exe"), subtype="FILE_PATH"
     )
+    VRtist_suffix: bpy.props.StringProperty(name="VRtist_suffix", default="_VRtist")
 
     data_directory: bpy.props.StringProperty(
         name="Data Directory", default=os.environ.get("MIXER_DATA_DIR", get_data_directory()), subtype="FILE_PATH"
     )
 
+    shared_folders: bpy.props.CollectionProperty(name="Shared Folders", type=SharedFolderItem)
+
     # Developer option to avoid sending scene content to server at the first connexion
     # Allow to quickly iterate debugging/test on large scenes with only one client in room
     # Main usage: optimization of client timers to check if updates are required
-    no_send_scene_content: bpy.props.BoolProperty(default=False)
+    no_send_scene_content: bpy.props.BoolProperty(name="Do Not Send Scene Content", default=False)
     no_start_server: bpy.props.BoolProperty(
-        name="Do not start server", default=os.environ.get("MIXER_NO_START_SERVER") is not None
+        name="Do Not Start Server on Connect", default=os.environ.get("MIXER_NO_START_SERVER") is not None
     )
     send_base_meshes: bpy.props.BoolProperty(default=True)
     send_baked_meshes: bpy.props.BoolProperty(default=True)
 
     display_own_gizmos: bpy.props.BoolProperty(default=False, name="Display Own Gizmos")
-    display_frustums_gizmos: bpy.props.BoolProperty(default=True, name="Display Frustums Gizmos")
-    display_names_gizmos: bpy.props.BoolProperty(default=True, name="Display Name Gizmos")
     display_ids_gizmos: bpy.props.BoolProperty(default=False, name="Display ID Gizmos")
+    display_debugging_tools: bpy.props.BoolProperty(default=False, name="Display Debugging Tools")
+
+    display_frustums_gizmos: bpy.props.BoolProperty(default=True, name="Display Frustums Gizmos")
+    display_frustums_names_gizmos: bpy.props.BoolProperty(default=True, name="Display Frustums User Names")
     display_selections_gizmos: bpy.props.BoolProperty(default=True, name="Display Selection Gizmos")
+    display_selections_names_gizmos: bpy.props.BoolProperty(default=True, name="Display Selection User Names")
 
     commands_send_interval: bpy.props.FloatProperty(
         name="Command Send Interval",
@@ -150,7 +201,10 @@ class MixerPreferences(bpy.types.AddonPreferences):
         draw_preferences_ui(self, context)
 
 
-classes = (MixerPreferences,)
+classes = (
+    SharedFolderItem,
+    MixerPreferences,
+)
 
 register_factory, unregister_factory = bpy.utils.register_classes_factory(classes)
 

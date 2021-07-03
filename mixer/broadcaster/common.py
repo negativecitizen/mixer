@@ -128,8 +128,8 @@ class MessageType(IntEnum):
     QUERY_ANIMATION_DATA = 139
 
     BLENDER_DATA_UPDATE = 140
-    CAMERA_ATTRIBUTES = 141
-    LIGHT_ATTRIBUTES = 142
+    _CAMERA_ATTRIBUTES = 141
+    _LIGHT_ATTRIBUTES = 142
 
     BLENDER_DATA_REMOVE = 143
     BLENDER_DATA_RENAME = 144
@@ -144,7 +144,10 @@ class MessageType(IntEnum):
     BLENDER_DATA_CREATE = 151
     BLENDER_DATA_MEDIA = 152
     EMPTY = 153
+    ADD_CONSTRAINT = 154
+    REMOVE_CONSTRAINT = 155
     ASSET_BANK = 156
+    SAVE = 157
 
     OPTIMIZED_COMMANDS = 200
     TRANSFORM = 201
@@ -202,6 +205,7 @@ class ClientAttributes:
     USERSCENES_VIEWS_SCREEN_CORNERS = (
         "screen_corners"  # type = list[float3], 4 elements, bottom_left, bottom_right, top_right, top_left
     )
+    USERMODE = "user_mode"  # type = str
 
 
 class RoomAttributes:
@@ -215,6 +219,14 @@ class RoomAttributes:
     """
 
     NAME = "name"  # Sent by server only, type = str, the name of the room which is unique for each room
+    BLENDER_VERSION = (
+        "blender_version"  # Sent by server only, type = str, the version of blender which created the room
+    )
+    MIXER_VERSION = "mixer_version"  # Sent by server only, type = str, the version of mixer which created the room
+    IGNORE_VERSION_CHECK = (
+        "ignore_version_check"  # Sent by server only, type = str, to ignore blender and mixer versions
+    )
+    GENERIC_PROTOCOL = "generic_protocol"  # Sent by server only, type = bool
     KEEP_OPEN = (
         "keep_open"  # Sent by server only, type = bool, indicate if the room should be kept open after all clients left
     )

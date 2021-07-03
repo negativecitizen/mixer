@@ -58,6 +58,7 @@ from mixer.blender_client import material as material_api
 from mixer.blender_client import mesh as mesh_api
 from mixer.blender_client import object_ as object_api
 from mixer.blender_client import scene as scene_api
+from mixer.blender_client import constraint as constraint_api
 from mixer.blender_data.proxy import ensure_uuid
 import mixer.shot_manager as shot_manager
 import mixer.asset_bank as asset_bank
@@ -543,6 +544,12 @@ class BlenderClient(Client):
         if ob.data:
             ob.data.animation_data_clear()
 
+    def build_save(self, data):
+        filename, file_extension = os.path.splitext(bpy.data.filepath)
+        if get_mixer_prefs().VRtist_suffix not in filename:
+            filename = filename + get_mixer_prefs().VRtist_suffix + file_extension
+        bpy.ops.wm.save_as_mainfile(filepath=filename, copy=True)
+
     def build_montage_mode(self, data):
         index = 0
         montage, index = common.decode_bool(data, index)
@@ -582,6 +589,10 @@ class BlenderClient(Client):
             path = self.get_object_path(obj)
             mesh_name = self.get_mesh_name(mesh)
 
+            # objects may share mesh but baked mesh may be different in instances with different modifiers
+            if len(obj.modifiers) > 0:
+                mesh_name = obj.name_full + "_" + mesh_name
+
         binary_buffer = common.encode_string(path) + common.encode_string(mesh_name)
 
         binary_buffer += mesh_api.encode_mesh(
@@ -604,12 +615,6 @@ class BlenderClient(Client):
         self.add_command(common.Command(MessageType.MESH, binary_buffer, 0))
 
     def build_mesh(self, command_data):
-        if not share_data.use_vrtist_protocol():
-            return self.build_mesh_generic(command_data)
-        else:
-            return self.build_mesh_vrtist(command_data)
-
-    def build_mesh_vrtist(self, command_data):
         index = 0
 
         path, index = common.decode_string(command_data, index)
@@ -637,24 +642,6 @@ class BlenderClient(Client):
             material_name, index = common.decode_string(command_data, index)
             if slot.link == "OBJECT" and material_name != "":
                 slot.material = material_api.get_or_create_material(material_name)
-
-    def build_mesh_generic(self, command_data):
-        index = 0
-
-        uuid, index = common.decode_string(command_data, index)
-        mesh_name, index = common.decode_string(command_data, index)
-        logger.info("build_mesh_generic %s", mesh_name)
-
-        meshes_proxy = share_data.bpy_data_proxy.data("meshes")
-        mesh_proxy = meshes_proxy.data(uuid)
-        if mesh_proxy is None:
-            # should not happen because a minimal generic Mesh BLENDER_DATA_CREATE is send before sending MESH
-            logger.warning(f"build_mesh for unregistered datablock {mesh_name} {uuid}. Ignored")
-            return
-        else:
-            mesh = share_data.bpy_data_proxy.context().proxy_state.datablocks[uuid]
-
-        index = mesh_api.decode_mesh_generic(self, mesh, command_data, index)
 
     def send_set_current_scene(self, name):
         buffer = common.encode_string(name)
@@ -758,23 +745,6 @@ class BlenderClient(Client):
         self.send_animation_buffer(obj.name_full, obj.animation_data, "rotation_euler", 2)
         self.send_animation_buffer(obj.name_full, obj.data.animation_data, "lens")
 
-    def send_camera_attributes(self, obj):
-        buffer = (
-            common.encode_string(obj.name_full)
-            + common.encode_float(obj.data.lens)
-            + common.encode_float(obj.data.dof.aperture_fstop)
-            + common.encode_float(obj.data.dof.focus_distance)
-        )
-        self.add_command(common.Command(MessageType.CAMERA_ATTRIBUTES, buffer, 0))
-
-    def send_light_attributes(self, obj):
-        buffer = (
-            common.encode_string(obj.name_full)
-            + common.encode_float(obj.data.energy)
-            + common.encode_color(obj.data.color)
-        )
-        self.add_command(common.Command(MessageType.LIGHT_ATTRIBUTES, buffer, 0))
-
     def send_current_camera(self, camera_name):
         buffer = common.encode_string(camera_name)
         self.add_command(common.Command(MessageType.CURRENT_CAMERA, buffer, 0))
@@ -842,6 +812,7 @@ class BlenderClient(Client):
         share_data.end_frame = bpy.context.scene.frame_end
 
     def override_context(self):
+        # see https://blender.stackexchange.com/questions/6101/poll-failed-context-incorrect-example-bpy-ops-view3d-background-image-add
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type == "VIEW_3D":
@@ -915,7 +886,11 @@ class BlenderClient(Client):
                 windows.append({"scene": scene, "view_layer": view_layer, "screen": screen, "areas_3d": areas_3d})
 
         # Documentation to update if you change "blender_windows": doc/protocol.md
-        return {"blender_windows": windows, common.ClientAttributes.USERSCENES: scene_attributes}
+        return {
+            "blender_windows": windows,
+            ClientAttributes.USERSCENES: scene_attributes,
+            ClientAttributes.USERMODE: bpy.context.mode,
+        }
 
     def network_consumer(self):
         """
@@ -966,6 +941,7 @@ class BlenderClient(Client):
                 if command.type == MessageType.GROUP_END:
                     elapse = time.monotonic() - groups.pop()
                     group_id = len(groups)
+                    share_data.receive_sanity_check()
                     logger.warning(f"Command group {group_id} processed in {elapse:.1f} seconds")
                     continue
 
@@ -1117,8 +1093,14 @@ class BlenderClient(Client):
                     elif command.type == MessageType.SHOT_MANAGER_ACTION:
                         shot_manager.build_shot_manager_action(command.data)
 
+                    elif command.type == MessageType.ADD_CONSTRAINT:
+                        constraint_api.build_add_constraint(command.data)
+                    elif command.type == MessageType.REMOVE_CONSTRAINT:
+                        constraint_api.build_remove_constraint(command.data)
                     elif command.type == MessageType.ASSET_BANK:
                         delayed_messages.append(delayed_message_call(asset_bank.receive_message, command.data))
+                    elif command.type == MessageType.SAVE:
+                        self.build_save(command.data)
 
                     elif command.type == MessageType.BLENDER_DATA_UPDATE:
                         data_api.build_data_update(command.data)
@@ -1254,16 +1236,20 @@ def clear_scene_content():
             "cameras",
             "collections",
             "curves",
+            "fonts",
             "grease_pencils",
             "images",
             "lights",
             "objects",
             "materials",
-            "metaballs",
             "meshes",
+            "metaballs",
+            "movieclips",
+            "node_groups",
+            "sounds",
+            "texts",
             "textures",
             "worlds",
-            "sounds",
         ]
 
         for name in data:
@@ -1272,6 +1258,7 @@ def clear_scene_content():
                 collection.remove(datablock)
 
         bpy.data.batch_remove(bpy.data.shape_keys.values())
+        bpy.data.batch_remove(bpy.data.libraries.values())
 
         # Cannot remove the last scene at this point, treat it differently
         for scene in bpy.data.scenes[:-1]:
@@ -1282,8 +1269,8 @@ def clear_scene_content():
 
         if len(bpy.data.scenes) == 1:
             scene = bpy.data.scenes[0]
-            logger.warning(f"clear_scene_contents. leaving {scene} ...")
-            logger.warning(f"...  with uuid {scene.mixer_uuid}, renamed as _mixer_to_be_removed_")
+            logger.info(f"clear_scene_contents. leaving {scene} ...")
+            logger.info(f"...  with uuid {scene.mixer_uuid}, renamed as _mixer_to_be_removed_")
             scene.name = "_mixer_to_be_removed_"
             scene.mixer_uuid = "_mixer_to_be_removed_"
 
@@ -1311,6 +1298,7 @@ def send_scene_content():
         if not share_data.use_vrtist_protocol():
             generic.send_scene_data_to_server(None, None)
         else:
+            share_data.client.send_set_current_scene(bpy.context.scene.name_full)
             # Temporary waiting for material sync. Should move to send_scene_data_to_server
             for material in bpy.data.materials:
                 share_data.client.send_material(material)
@@ -1326,5 +1314,4 @@ def send_scene_content():
         share_data.start_frame = bpy.context.scene.frame_start
         share_data.end_frame = bpy.context.scene.frame_end
         share_data.client.send_frame(bpy.context.scene.frame_current)
-
         share_data.client.send_group_end()
